@@ -24,7 +24,6 @@ namespace ctranslate2 {
       , _pre_norm(pre_norm)
       , _activation_type(activation_type)
       , _ff1(model, scope + "/linear_0", &_activation_type)
-      , _ff1_noact(build_optional_layer<Dense>(model, scope + "/linear_0_noact"))
       , _ff2(model, scope + "/linear_1") {
     }
 
@@ -40,11 +39,6 @@ namespace ctranslate2 {
 
       StorageView inner(dtype, device);
       _ff1(*x, inner);
-      if (_ff1_noact) {
-        StorageView linear(dtype, device);
-        (*_ff1_noact)(*x, linear);
-        ops::Mul()(linear, inner, inner);
-      }
 
       _ff2(inner, output, _layer_norm ? &input : nullptr);
 
@@ -63,10 +57,6 @@ namespace ctranslate2 {
                         num_heads,
                         /*self_attention=*/true,
                         pre_norm)))
-      , _input_layer_norm(build_optional_layer<LayerNorm>(model, scope + "/input_layer_norm"))
-      , _post_attention_layer_norm(build_optional_layer<LayerNorm>(model, scope + "/post_attention_layer_norm"))
-      , _pre_feedforward_layer_norm(build_optional_layer<LayerNorm>(model, scope + "/pre_feedforward_layer_norm"))
-      , _post_feedforward_layer_norm(build_optional_layer<LayerNorm>(model, scope + "/post_feedforward_layer_norm"))
       , _ff(model, scope + "/ffn", pre_norm, activation_type) {
     }
 
@@ -74,72 +64,23 @@ namespace ctranslate2 {
     void TransformerEncoderLayer::operator()(const StorageView& input,
                                              const StorageView* lengths,
                                              StorageView& output,
-                                             const Padder* padder,
-                                             StorageView* position_bias) const {
+                                             const Padder* padder) const {
       PROFILE("TransformerEncoderLayer");
 
       const DataType dtype = input.dtype();
       const Device device = input.device();
 
-      // Check if using pre_post_layer_norm pattern (T5Gemma style)
-      const bool pre_post_layer_norm = _input_layer_norm && _post_attention_layer_norm
-                                        && _pre_feedforward_layer_norm && _post_feedforward_layer_norm;
-
-      if (pre_post_layer_norm) {
-        StorageView hidden(dtype, device);
-        StorageView context(dtype, device);
-
-        (*_input_layer_norm)(input, hidden);
-
-        if (_self_attention)
-          (*_self_attention)(hidden,
-                          hidden,
-                          lengths,
-                          context,
-                          nullptr,
-                          nullptr,
-                          nullptr,
-                          padder,
-                          padder,
-                          true,
-                          position_bias);
-
-        // post_self_attn_layernorm
-        (*_post_attention_layer_norm)(context, output);
-
-        // residual + hidden_states
-        ops::Add()(input, output, output);
-
-        context = std::move(output);
-        (*_pre_feedforward_layer_norm)(context, output);
-        hidden = std::move(output);
-
-        // mlp
-        _ff(hidden, output);
-
-        // post_feedforward_layernorm
-        hidden = std::move(output);
-        (*_post_feedforward_layer_norm)(hidden, output);
-
-        // residual + hidden_states
-        ops::Add()(context, output, output);
-        return;
-      }
-
-      // Original path for standard pre-norm/post-norm architectures
       StorageView context(dtype, device);
-      if (_self_attention)
-        (*_self_attention)(input,
-                        input,
-                        lengths,
-                        context,
-                        nullptr,
-                        nullptr,
-                        nullptr,
-                        padder,
-                        padder,
-                        true,
-                        position_bias);
+      (*_self_attention)(input,
+                         input,
+                         lengths,
+                         context,
+                         nullptr,
+                         nullptr,
+                         nullptr,
+                         padder,
+                         padder,
+                         true);
       _ff(context, output);
     }
 
@@ -155,14 +96,6 @@ namespace ctranslate2 {
                         /*self_attention=*/true,
                         pre_norm,
                         /*is_decoder=*/true)))
-      , _shared_layer_norm(build_optional_layer<LayerNorm>(model, scope + "/shared_layer_norm"))
-      , _input_layer_norm(build_optional_layer<LayerNorm>(model, scope + "/input_layer_norm"))
-      , _post_attention_layer_norm(build_optional_layer<LayerNorm>(
-                                     model, scope + "/post_attention_layer_norm"))
-      , _pre_feedforward_layer_norm(build_optional_layer<LayerNorm>(
-                                     model, scope + "/pre_feedforward_layer_norm"))
-      , _post_feedforward_layer_norm(build_optional_layer<LayerNorm>(
-                                     model, scope + "/post_feedforward_layer_norm"))
       , _encoder_attention(build_optional_layer<MultiHeadAttention>(model,
                                                                     scope + "/attention",
                                                                     num_heads,
@@ -170,14 +103,7 @@ namespace ctranslate2 {
                                                                     pre_norm,
                                                                     /*is_decoder=*/true))
       , _ff(model, scope + "/ffn", pre_norm, activation_type)
-      , _external_pre_encoder_attention_layer_norm(build_optional_layer<LayerNorm>(
-                                     model, scope + "/external_pre_encoder_attention_layer_norm"))
-      , _external_post_encoder_attention_layer_norm(build_optional_layer<LayerNorm>(
-                                     model, scope + "/external_post_encoder_attention_layer_norm"))
-      , _layer_scalar(model.get_attribute_with_default<float>(scope + "/layer_scalar", 1.f))
-      , _has_merged_encoder_attention(
-          static_cast<MultiHeadAttention*>(_self_attention.get())->has_merged_encoder_attention())
-      {
+    {
     }
 
     void TransformerDecoderLayer::operator()(const StorageView& input,
@@ -192,145 +118,22 @@ namespace ctranslate2 {
                                              StorageView* attention,
                                              const Padder* input_padder,
                                              const Padder* memory_padder,
-                                             bool return_normalized_attention,
-                                             StorageView* position_bias,
-                                             dim_t offset) const {
+                                             bool return_normalized_attention) const {
       PROFILE("TransformerDecoderLayer");
 
       const DataType dtype = input.dtype();
       const Device device = input.device();
 
-      const bool pre_post_layer_norm = _post_feedforward_layer_norm && _pre_feedforward_layer_norm;
-      if (pre_post_layer_norm) {
-        StorageView hidden(dtype, device);
-        StorageView context(dtype, device);
-        (*_input_layer_norm)(input, hidden);
-
-        if (_has_merged_encoder_attention) {
-          static_cast<MultiHeadAttention*>(_self_attention.get())->forward_merged(
-            hidden,
-            memory,
-            memory_lengths,
-            input_length,
-            context,
-            cached_self_attn_keys,
-            cached_self_attn_values,
-            cached_attn_keys,
-            cached_attn_values,
-            input_padder,
-            memory_padder,
-            offset);
-        } else if (_self_attention) {
-          (*_self_attention)(hidden,
-                             hidden,
-                             input_length,
-                             context,
-                             cached_self_attn_keys,
-                             cached_self_attn_values,
-                             nullptr,
-                             input_padder,
-                             input_padder,
-                             true,
-                             position_bias,
-                             offset);
-        }
-        (*_post_attention_layer_norm)(context, output);
-        ops::Add()(output, input, output);
-
-        if (_encoder_attention) {
-            StorageView cross_attn_in = output;  // save for residual
-
-            StorageView query_normalized(dtype, device);
-            if (_external_pre_encoder_attention_layer_norm) {
-                (*_external_pre_encoder_attention_layer_norm)(output, query_normalized);
-            }
-            else {
-                query_normalized.shallow_copy(output);
-            }
-
-            (*_encoder_attention)(query_normalized,
-                                  *memory,
-                                  memory_lengths,
-                                  context,
-                                  cached_attn_keys,
-                                  cached_attn_values,
-                                  attention,
-                                  input_padder,
-                                  memory_padder,
-                                  return_normalized_attention);
-
-            if (_external_post_encoder_attention_layer_norm) {
-                (*_external_post_encoder_attention_layer_norm)(context, context);
-            }
-            ops::Add()(context, cross_attn_in, output);
-        }
-
-        context = std::move(output);
-        (*_pre_feedforward_layer_norm)(context, output);
-        hidden = std::move(output);
-
-        _ff(hidden, output);
-
-        hidden = std::move(output);
-        (*_post_feedforward_layer_norm)(hidden, output);
-        ops::Add()(output, context, output);
-
-        // Gemma 4 layer scalar
-        if (_layer_scalar != 1.f)
-          ops::Mul()(output, StorageView(_layer_scalar).to(dtype), output);
-
-        return;
-      }
-
-      const bool use_parallel_residual = _shared_layer_norm || _input_layer_norm;
-
-      if (use_parallel_residual) {
-        // The parallel residual implementation assumes there is no cross attention.
-        StorageView hidden(dtype, device);
-
-        if (_shared_layer_norm)
-          (*_shared_layer_norm)(input, hidden);
-        else
-          (*_input_layer_norm)(input, hidden);
-
-        StorageView attn(dtype, device);
-        if (_self_attention)
-          (*_self_attention)(hidden,
-                        hidden,
-                        input_length,
-                        attn,
-                        cached_self_attn_keys,
-                        cached_self_attn_values,
-                        nullptr,
-                        input_padder,
-                        input_padder,
-                        true,
-                        position_bias,
-                        offset);
-
-        if (_post_attention_layer_norm)
-          (*_post_attention_layer_norm)(input, hidden);
-
-        _ff(hidden, output);
-
-        ops::Add()(output, input, output);
-        ops::Add()(output, attn, output);
-
-        return;
-      }
-      if (_self_attention)
-        (*_self_attention)(input,
-                      input,
-                      input_length,
-                      output,
-                      cached_self_attn_keys,
-                      cached_self_attn_values,
-                      nullptr,
-                      input_padder,
-                      input_padder,
-                      true,
-                      position_bias,
-                      offset);
+      (*_self_attention)(input,
+                         input,
+                         input_length,
+                         output,
+                         cached_self_attn_keys,
+                         cached_self_attn_values,
+                         nullptr,
+                         input_padder,
+                         input_padder,
+                         true);
 
       StorageView context(dtype, device);
       if (_encoder_attention) {
@@ -357,154 +160,46 @@ namespace ctranslate2 {
     build_position_encoder(const models::Model& model,
                            const std::string& scope,
                            const Layer& embeddings) {
-      if (model.get_variable_if_exists(scope + "/encodings"))
-        return std::make_unique<PositionEmbedding>(model, scope);
-      else
-        return std::make_unique<SinusoidalPositionEncoder>(embeddings.output_size(),
-                                                           embeddings.output_type(),
-                                                           model.device());
+      (void)embeddings;
+      if (!model.get_variable_if_exists(scope + "/encodings"))
+        throw std::invalid_argument("Position encodings " + scope + "/encodings are missing "
+                                    "(sinusoidal encoders are not supported by this build)");
+      return std::make_unique<PositionEmbedding>(model, scope);
     }
-
-    static std::unique_ptr<const StorageView>
-    build_embeddings_scale(const models::Model& model,
-                           const std::string& scope,
-                           const Layer& embeddings) {
-      const auto* scale = model.get_variable_if_exists(scope + "/scale_embeddings");
-
-      // Backward compatibility with older models.
-      if (!scale)
-        scale = model.get_variable_if_exists(scope + "/embeddings/multiply_by_sqrt_depth");
-
-      StorageView value;
-
-      // The attribute can either be a boolean flag or the actual scale value.
-      if (!scale || (scale->dtype() == DataType::INT8 && scale->as_scalar<int8_t>()))
-        value = StorageView(std::sqrt(static_cast<float>(embeddings.output_size())));
-      else if (scale->dtype() != DataType::INT8 && scale->as_scalar<float>() != 1.f)
-        value = *scale;
-      else
-        return nullptr;
-
-      return std::make_unique<StorageView>(value.to(embeddings.output_type()));
-    }
-
-
-    // T5-style models compute the relative attention bias in the first layer and share it
-    // with the following layers. UMT5-style models give every layer its own bias table.
-    // Identical tables are serialized as aliases resolving to the same StorageView, so
-    // comparing the resolved pointers tells the two cases apart.
-    static bool has_shared_position_bias(const models::Model& model,
-                                         const std::string& scope,
-                                         const size_t num_layers) {
-      const auto bias_name = [&scope](size_t i) {
-        return scope + "/layer_" + std::to_string(i) + "/self_attention/relative_attention_bias";
-      };
-
-      const StorageView* first = model.get_variable_if_exists(bias_name(0));
-      if (!first)
-        return true;  // no relative attention bias: the shared buffer is never filled
-
-      for (size_t i = 1; i < num_layers; ++i) {
-        if (model.get_variable_if_exists(bias_name(i)) != first)
-          return false;
-      }
-
-      return true;
-    }
-
-
-    TransformerEncoder::TransformerEncoder(const models::Model& model, const std::string& scope)
-      : _embeddings(model, scope + "/embeddings",
-                    model.get_enum_value<EmbeddingsMerge>(scope + "/embeddings_merge"))
-      , _embeddings_scale(build_embeddings_scale(model, scope, _embeddings))
-      , _num_heads(model.get_attribute_with_default<int32_t>(scope + "/num_heads", 8))
-      , _compute_type(model.effective_compute_type())
-      , _layernorm_embedding(build_optional_layer<LayerNorm>(model, scope + "/layernorm_embedding"))
-      , _output_norm(build_optional_layer<LayerNorm>(model, scope + "/layer_norm"))
-      , _layers(build_layers_list<const TransformerEncoderLayer>(
-                  model,
-                  scope + "/layer",
-                  _num_heads,
-                  model.get_flag_with_default(scope + "/pre_norm", true),
-                  model.get_enum_value<ops::ActivationType>(scope + "/activation")))
-      , _position_encoder(_layers.front()->get_self_attention().has_positional_embeddings()
-                          ? nullptr
-                          : build_position_encoder(model, scope + "/position_encodings", _embeddings))
-      , _shared_position_bias(has_shared_position_bias(model, scope, _layers.size()))
-    {
-    }
-
-    void TransformerEncoder::operator()(const std::vector<StorageView>& ids,
-                                        const StorageView* lengths,
-                                        StorageView& output) {
-      PROFILE("TransformerEncoder");
-      StorageView input(output.dtype(), output.device());
-      _embeddings(ids, input);
-      if (_embeddings_scale)
-        ops::Mul()(input, *_embeddings_scale, input);
-      if (_position_encoder)
-        (*_position_encoder)(input);
-      if (_layernorm_embedding)
-        (*_layernorm_embedding)(input, input);
-
-      const dim_t max_time = input.dim(1);
-
-      // Remove padding to reduce the amount of computation.
-      std::unique_ptr<Padder> padder;
-      std::unique_ptr<StorageView> lengths_mask;
-
-      if (lengths) {
-        if (Padder::allow_padding_removal(output.device(), _compute_type)) {
-          padder = std::make_unique<Padder>(*lengths, max_time);
-          padder->remove_padding(input);
-        }
-
-        int num_heads = _num_heads;
-        lengths_mask = std::make_unique<StorageView>(
-          layers::MultiHeadAttention::prepare_length_mask(*lengths, num_heads, max_time));
-      }
-
-      StorageView position_bias(output.dtype(), output.device());
-      StorageView* position_bias_ptr = _shared_position_bias ? &position_bias : nullptr;
-
-      for (size_t l = 0; l < _layers.size(); ++l) {
-        (*_layers[l])(input, lengths_mask.get(), output, padder.get(), position_bias_ptr);
-        if (l + 1 < _layers.size())
-          input = std::move(output);
-      }
-      if (_output_norm)
-        (*_output_norm)(output, output);
-      if (padder)
-        padder->add_padding(output);
-    }
-
 
     TransformerDecoder::TransformerDecoder(const models::Model& model, const std::string& scope)
       : Decoder(model.device())
       , _num_heads(model.get_attribute_with_default<int32_t>(scope + "/num_heads", 8))
       , _compute_type(model.effective_compute_type())
       , _embeddings(model, scope + "/embeddings")
-      , _start_from_zero_embedding(model.get_flag_with_default(scope + "/start_from_zero_embedding",
-                                                               false))
-      , _embeddings_scale(build_embeddings_scale(model, scope, _embeddings))
-      , _layernorm_embedding(build_optional_layer<LayerNorm>(model, scope + "/layernorm_embedding"))
       , _output_norm(build_optional_layer<LayerNorm>(model, scope + "/layer_norm"))
-      , _project_in(build_optional_layer<Dense>(model, scope + "/project_in"))
-      , _project_out(build_optional_layer<Dense>(model, scope + "/project_out"))
       , _layers(build_layers_list<const TransformerDecoderLayer>(
                   model,
                   scope + "/layer",
                   _num_heads,
                   model.get_flag_with_default(scope + "/pre_norm", true),
                   model.get_enum_value<ops::ActivationType>(scope + "/activation")))
-      , _position_encoder(_layers.front()->get_self_attention().has_positional_embeddings()
-                          ? nullptr
-                          : build_position_encoder(model, scope + "/position_encodings", _embeddings))
+      , _position_encoder(build_position_encoder(model, scope + "/position_encodings", _embeddings))
       , _with_encoder_attention(_layers.front()->has_cross_attention())
-      , _proj(model, scope + "/projection")
-      , _sliding_window(model.get_attribute_with_default<int32_t>(scope + "/sliding_window", 0))
-      , _final_logit_softcapping(model.get_attribute_with_default<float>(scope + "/final_logit_softcapping", 0.f))
-      , _shared_position_bias(has_shared_position_bias(model, scope, _layers.size())) {
+      , _proj(model, scope + "/projection") {
+
+      // Whisper models save these decoder options, always disabled.
+      for (const char* flag : {"/alibi", "/start_from_zero_embedding"}) {
+        if (model.get_flag_with_default(scope + flag, false))
+          throw std::invalid_argument("Unsupported decoder option " + scope + flag
+                                      + " in this Whisper-only build");
+      }
+      for (const char* option : {"/sliding_window", "/final_logit_softcapping", "/scale_outputs",
+                                 "/project_in/weight", "/project_out/weight",
+                                 "/layernorm_embedding/gamma"}) {
+        if (model.get_variable_if_exists(scope + option))
+          throw std::invalid_argument("Unsupported decoder option " + scope + option
+                                      + " in this Whisper-only build");
+      }
+      const auto* scale = model.get_variable_if_exists(scope + "/scale_embeddings");
+      if (!scale || (scale->dtype() == DataType::INT8 ? scale->as_scalar<int8_t>() != 0
+                                                       : scale->as_scalar<float>() != 1.f))
+        throw std::invalid_argument("Scaled decoder embeddings are not supported by this build");
 
       dim_t alignment_layer = (
         model.get_attribute_with_default<int32_t>(scope + "/alignment_layer", -1));
@@ -517,12 +212,6 @@ namespace ctranslate2 {
         alignment_heads = _num_heads;
 
       set_alignment_heads(alignment_layer, alignment_heads);
-
-      const auto* outputs_scale = model.get_variable_if_exists(scope + "/scale_outputs");
-      if (outputs_scale) {
-        const DataType dtype = get_default_float_type(_compute_type);
-        _outputs_scale = std::make_unique<StorageView>(outputs_scale->to(dtype));
-      }
     }
 
     DecoderState TransformerDecoder::initial_state(bool iterative_decoding) const {
@@ -771,8 +460,6 @@ namespace ctranslate2 {
         _step_graphs = std::make_unique<StepGraphs>();
       StepGraphs& graphs = *_step_graphs;
       if (graphs.disabled)
-        return false;
-      if (_sliding_window > 0)
         return false;
 
       if (graphs.output_layer_version != output_layer_version()) {
@@ -1098,28 +785,12 @@ namespace ctranslate2 {
       StorageView layer_out(dtype, device);
 
       _embeddings(ids, layer_in);
-      if (_start_from_zero_embedding)
-        zero_first_timestep(layer_in, step);
-      if (_embeddings_scale && (!_start_from_zero_embedding || step != 0))
-        ops::Mul()(layer_in, *_embeddings_scale, layer_in);
-      if (_project_in) {
-        (*_project_in)(layer_in, layer_out);
-        layer_in = std::move(layer_out);
-      }
       if (layer_in.rank() == 2)
         layer_in.expand_dims(1);
-      if (_position_encoder)
-        (*_position_encoder)(layer_in, std::max(step, dim_t(0)));
-      if (_layernorm_embedding)
-        (*_layernorm_embedding)(layer_in, layer_in);
+      (*_position_encoder)(layer_in, std::max(step, dim_t(0)));
 
       const dim_t batch_size = layer_in.dim(0);
-      dim_t max_time;
-
-      if (_sliding_window > 0 && layer_in.dim(1) > _sliding_window) {
-        max_time = _sliding_window;
-      } else
-        max_time = layer_in.dim(1);
+      const dim_t max_time = layer_in.dim(1);
 
       const bool allow_padding_removal = Padder::allow_padding_removal(_device, _compute_type);
 
@@ -1131,8 +802,6 @@ namespace ctranslate2 {
         input_lengths = std::make_unique<StorageView>(Shape{ids.dim(0)}, int32_t(max_time), device);
         lengths = input_lengths.get();
       }
-
-      bool multi_query = _layers.front()->get_self_attention().multi_query();
 
       if (lengths) {
         if (allow_padding_removal) {
@@ -1146,9 +815,7 @@ namespace ctranslate2 {
           *lengths,
           num_heads,
           max_time,
-          /*mask_future=*/true,
-          multi_query);
-
+          /*mask_future=*/true);
 
         if (step > 0)
           ops::Add()(lengths_mask, StorageView(int32_t(step)), lengths_mask);
@@ -1186,93 +853,49 @@ namespace ctranslate2 {
       if (attention)
         alignment_heads.reserve(_layers.size());
 
-      StorageView position_bias(dtype, device);
-      StorageView* position_bias_ptr = _shared_position_bias ? &position_bias : nullptr;
+      for (size_t l = 0; l < _layers.size(); ++l) {
+        StorageView* cached_self_attn_keys = nullptr;
+        StorageView* cached_self_attn_values = nullptr;
+        StorageView* cached_attn_keys = nullptr;
+        StorageView* cached_attn_values = nullptr;
 
-      std::vector<StorageView> layer_ins;
-
-      while (true) {
-        dim_t prompt_size = layer_in.dim(1);
-        if (_sliding_window == 0 || prompt_size <= _sliding_window) {
-          layer_ins.push_back(std::move(layer_in));
-          break;
-        }
-        if (layer_in.dim(1) > _sliding_window) {
-          StorageView tmp(dtype, device);
-          const ops::Split split_op(1, {_sliding_window, prompt_size - _sliding_window});
-          split_op(layer_in, tmp, layer_in);
-          layer_ins.push_back(std::move(tmp));
-        }
-      }
-
-      for (size_t i = 0; i < layer_ins.size(); ++i) {
-        StorageView* layer_in_chunk = &layer_ins[i];
-        for (size_t l = 0; l < _layers.size(); ++l) {
-          StorageView* cached_self_attn_keys = nullptr;
-          StorageView* cached_self_attn_values = nullptr;
-          StorageView* cached_attn_keys = nullptr;
-          StorageView* cached_attn_values = nullptr;
-
-          if (step >= 0) {
-            const std::string l_str = std::to_string(l);
-            cached_self_attn_keys = &state.at("self_keys_" + l_str);
-            cached_self_attn_values = &state.at("self_values_" + l_str);
-            if (_with_encoder_attention) {
-              cached_attn_keys = &state.at("memory_keys_" + l_str);
-              cached_attn_values = &state.at("memory_values_" + l_str);
-            }
-          }
-
-          std::unique_ptr<StorageView> heads_to_select = get_layer_alignment_heads(l, batch_size);
-          std::unique_ptr<StorageView> layer_attention;
-          if (attention && heads_to_select)
-            layer_attention = std::make_unique<StorageView>(dtype, device);
-
-          dim_t offset = _sliding_window * i + step;
-          offset = offset < 0 ? 0 : offset;
-          if (i > 0) {
-            auto max_tokens = _sliding_window + layer_in_chunk->dim(1);
-            StorageView tmp_lengths = StorageView(Shape{layer_in_chunk->dim(0)}, int32_t(max_tokens), device);
-            int num_heads = _num_heads;
-            StorageView lengths_mask = layers::MultiHeadAttention::prepare_length_mask(
-              tmp_lengths,
-              num_heads,
-              max_tokens,
-              /*mask_future=*/true,
-              multi_query);
-
-            const ops::Slide slide_lengths_op(2, _sliding_window, layer_in_chunk->dim(1));
-            // reuse tmp_lengths
-            slide_lengths_op(lengths_mask, tmp_lengths);
-            input_lengths_mask = std::make_unique<StorageView>(std::move(tmp_lengths));
-          }
-
-          if (_capture_cache_targets)
-            self_attention_cache_target() = &(*_capture_cache_targets)[l];
-          (*_layers[l])(*layer_in_chunk,
-                        input_lengths_mask.get(),
-                        memory,
-                        memory_lengths_mask.get(),
-                        cached_self_attn_keys,
-                        cached_self_attn_values,
-                        cached_attn_keys,
-                        cached_attn_values,
-                        layer_out,
-                        layer_attention.get(),
-                        input_padder.get(),
-                        memory_padder.get(),
-                        return_normalized_attention(),
-                        position_bias_ptr,
-                        offset);
-          self_attention_cache_target() = nullptr;
-          *layer_in_chunk = std::move(layer_out);
-
-          if (layer_attention) {
-            alignment_heads.emplace_back(dtype, device);
-            ops::Gather(1, 1)(*layer_attention, *heads_to_select, alignment_heads.back());
+        if (step >= 0) {
+          const std::string l_str = std::to_string(l);
+          cached_self_attn_keys = &state.at("self_keys_" + l_str);
+          cached_self_attn_values = &state.at("self_values_" + l_str);
+          if (_with_encoder_attention) {
+            cached_attn_keys = &state.at("memory_keys_" + l_str);
+            cached_attn_values = &state.at("memory_values_" + l_str);
           }
         }
-        layer_in = std::move(*layer_in_chunk);
+
+        std::unique_ptr<StorageView> heads_to_select = get_layer_alignment_heads(l, batch_size);
+        std::unique_ptr<StorageView> layer_attention;
+        if (attention && heads_to_select)
+          layer_attention = std::make_unique<StorageView>(dtype, device);
+
+        if (_capture_cache_targets)
+          self_attention_cache_target() = &(*_capture_cache_targets)[l];
+        (*_layers[l])(layer_in,
+                      input_lengths_mask.get(),
+                      memory,
+                      memory_lengths_mask.get(),
+                      cached_self_attn_keys,
+                      cached_self_attn_values,
+                      cached_attn_keys,
+                      cached_attn_values,
+                      layer_out,
+                      layer_attention.get(),
+                      input_padder.get(),
+                      memory_padder.get(),
+                      return_normalized_attention());
+        self_attention_cache_target() = nullptr;
+        layer_in = std::move(layer_out);
+
+        if (layer_attention) {
+          alignment_heads.emplace_back(dtype, device);
+          ops::Gather(1, 1)(*layer_attention, *heads_to_select, alignment_heads.back());
+        }
       }
 
       if (step == 0) {
@@ -1301,24 +924,9 @@ namespace ctranslate2 {
       if (outputs) {
         if (_output_norm)
           (*_output_norm)(layer_in, layer_in);
-        if (_project_out) {
-          (*_project_out)(layer_in, layer_out);
-          layer_in = std::move(layer_out);
-        }
-
-        if (_outputs_scale)
-          ops::Mul()(layer_in, *_outputs_scale, layer_in);
 
         if (return_logits) {
           _proj(layer_in, *outputs);
-          if (_final_logit_softcapping != 0.f) {
-            // logits = tanh(logits / cap) * cap  — squashes logits to (-cap, cap)
-            const auto dtype = outputs->dtype();
-            const auto device = outputs->device();
-            ops::Mul()(*outputs, StorageView(1.f / _final_logit_softcapping).to(dtype), *outputs);
-            ops::Tanh()(*outputs, *outputs);
-            ops::Mul()(*outputs, StorageView(_final_logit_softcapping).to(dtype), *outputs);
-          }
         } else
           *outputs = std::move(layer_in);
 

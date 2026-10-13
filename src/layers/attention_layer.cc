@@ -6,7 +6,6 @@
 #include <numeric>
 
 #include "dispatch.h"
-#include "cpu/parallel.h"
 
 namespace ctranslate2 {
   namespace layers {
@@ -38,12 +37,14 @@ namespace ctranslate2 {
       , _queries_scale(model.get_attribute_with_default<float>(
                          scope + "/queries_scale",
                          1.f / std::sqrt(static_cast<float>(_d_head))))
-      , _multi_query(model.get_flag_with_default(scope + "/multi_query", false))
-      , _num_heads_kv(_multi_query
-                      ? 1
-                      : model.get_attribute_with_default<int32_t>(scope + "/num_heads_kv", _num_heads))
-      , _sliding_window(model.get_attribute_with_default<int32_t>(scope + "/sliding_window", 0))
     {
+      for (const char* option : {"/multi_query", "/num_heads_kv", "/sliding_window",
+                                 "/rotary_dim", "/relative_attention_bias",
+                                 "/relative_position_keys", "/q_norm/gamma", "/memory_kv/weight"}) {
+        if (model.get_variable_if_exists(scope + option))
+          throw std::invalid_argument("Unsupported attention option " + scope + option
+                                      + " in this Whisper-only build");
+      }
     }
 
     DataType AttentionLayer::output_type() const {

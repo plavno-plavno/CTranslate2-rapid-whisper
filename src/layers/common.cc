@@ -66,73 +66,6 @@ namespace ctranslate2 {
     }
 
 
-    ParallelEmbeddings::ParallelEmbeddings(const models::Model& model,
-                                           const std::string& scope,
-                                           const EmbeddingsMerge merge)
-      : _merge(merge)
-    {
-      auto single_layer = build_optional_layer<Embeddings>(model, scope);
-      if (single_layer)
-        _layers.emplace_back(std::move(single_layer));
-      else
-        _layers = build_layers_list<const Embeddings>(model, scope);
-    }
-
-    DataType ParallelEmbeddings::output_type() const {
-      return _layers[0]->output_type();
-    }
-
-    dim_t ParallelEmbeddings::output_size() const {
-      dim_t size = 0;
-
-      switch (_merge) {
-      case EmbeddingsMerge::Concat:
-        for (const auto& layer : _layers)
-          size += layer->output_size();
-        break;
-      case EmbeddingsMerge::Add:
-        size = _layers[0]->output_size();
-        break;
-      };
-
-      return size;
-    }
-
-    void ParallelEmbeddings::operator()(const std::vector<StorageView>& ids,
-                                        StorageView& output) const {
-      if (ids.size() != _layers.size())
-        throw std::invalid_argument("Expected "
-                                    + std::to_string(_layers.size())
-                                    + " input features (including the main tokens), but got "
-                                    + std::to_string(ids.size())
-                                    + " input features instead");
-
-      for (size_t i = 0; i < _layers.size(); ++i) {
-        StorageView intermediate(output.device(), output.dtype());
-        (*_layers[i])(ids[i], intermediate);
-
-        if (i == 0) {
-          output = std::move(intermediate);
-        } else {
-
-          switch (_merge) {
-          case EmbeddingsMerge::Add: {
-            ops::Add()(intermediate, output, output);
-            break;
-          }
-
-          case EmbeddingsMerge::Concat: {
-            StorageView tmp = std::move(output);
-            ops::Concat(-1)({&tmp, &intermediate}, output);
-            break;
-          }
-          }
-
-        }
-      }
-    }
-
-
     void PositionEncoder::operator()(StorageView& input, dim_t index) {
       const dim_t time = input.dim(1);
       const dim_t depth = input.dim(-1);
@@ -183,56 +116,6 @@ namespace ctranslate2 {
 
     dim_t PositionEmbedding::num_positions() const {
       return _encoding.dim(0);
-    }
-
-
-    static StorageView generate_sinusoidal_position_encoding(dim_t max_time,
-                                                             dim_t depth,
-                                                             DataType dtype,
-                                                             Device device) {
-      const float log_timescale_increment = std::log(10000.f) / static_cast<float>(depth / 2 - 1);
-      StorageView timescales({depth / 2}, -log_timescale_increment);
-      for (dim_t i = 0; i < timescales.size(); ++i)
-        timescales.at<float>(i) = std::exp(timescales.at<float>(i) * i);
-
-      StorageView scaled_time({max_time, depth / 2});
-      for (dim_t i = 0; i < scaled_time.dim(0); ++i) {
-        for (dim_t j = 0; j < scaled_time.dim(1); ++j) {
-          scaled_time.at<float>({i, j}) = (i + 1) * timescales.at<float>(j);
-        }
-      }
-
-      StorageView sin_encoding;
-      StorageView cos_encoding;
-
-      ops::Sin()(scaled_time, sin_encoding);
-      ops::Cos()(scaled_time, cos_encoding);
-
-      StorageView encoding;
-      ops::Concat(-1)({&sin_encoding, &cos_encoding}, encoding);
-      return encoding.to(dtype).to(device);
-    }
-
-    SinusoidalPositionEncoder::SinusoidalPositionEncoder(dim_t depth, DataType dtype, Device device)
-      : _encoding(generate_sinusoidal_position_encoding(500, depth, dtype, device))
-    {
-    }
-
-    const StorageView& SinusoidalPositionEncoder::get_position_encoding(dim_t max_time) {
-      if (max_time > _encoding.dim(0))
-        _encoding = generate_sinusoidal_position_encoding(max_time,
-                                                          _encoding.dim(1),
-                                                          _encoding.dtype(),
-                                                          _encoding.device());
-      return _encoding;
-    }
-
-    DataType SinusoidalPositionEncoder::output_type() const {
-      return _encoding.dtype();
-    }
-
-    dim_t SinusoidalPositionEncoder::output_size() const {
-      return _encoding.dim(1);
     }
 
 

@@ -16,9 +16,6 @@ namespace ctranslate2 {
       StorageView* values;
     };
     SelfAttentionCacheTarget*& self_attention_cache_target();
-    StorageView make_relative_positions(dim_t queries_length,
-                                        dim_t keys_length,
-                                        dim_t max_position);
 
 
     class AttentionLayer : public Layer
@@ -42,15 +39,7 @@ namespace ctranslate2 {
                       StorageView* attention = nullptr,
                       const Padder* queries_padder = nullptr,
                       const Padder* values_padder = nullptr,
-                      bool return_normalized_attention = true,
-                      StorageView* position_bias = nullptr,
-                      dim_t offset = 0) const = 0;
-
-      virtual bool has_positional_embeddings() const = 0;
-
-      bool multi_query() const {
-        return _multi_query;
-      }
+                      bool return_normalized_attention = true) const = 0;
 
       static StorageView prepare_length_mask(const StorageView& lengths,
                                              const dim_t num_heads,
@@ -68,9 +57,6 @@ namespace ctranslate2 {
       const bool _pre_norm;
       const std::unique_ptr<const LayerNorm> _layer_norm;
       const float _queries_scale;
-      const bool _multi_query;
-      const dim_t _num_heads_kv;
-      const dim_t _sliding_window;
     };
   }
 }

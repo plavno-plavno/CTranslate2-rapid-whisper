@@ -64,27 +64,6 @@ namespace ctranslate2 {
     };
 
     // This enum order should remain fixed.
-    enum class EmbeddingsMerge {
-      Concat,
-      Add,
-    };
-
-    class ParallelEmbeddings : public Layer {
-    public:
-      ParallelEmbeddings(const models::Model& model,
-                         const std::string& scope,
-                         const EmbeddingsMerge merge);
-      size_t num_inputs() const {
-        return _layers.size();
-      }
-      DataType output_type() const override;
-      dim_t output_size() const override;
-      void operator()(const std::vector<StorageView>& ids, StorageView& output) const;
-    private:
-      const EmbeddingsMerge _merge;
-      std::vector<std::unique_ptr<const Embeddings>> _layers;
-    };
-
     // Base class for position encoders.
     class PositionEncoder : public Layer {
     public:
@@ -108,19 +87,6 @@ namespace ctranslate2 {
     };
 
     // Concrete position encoder computing sinusoidal position encodings (compatible with OpenNMT-tf).
-    class SinusoidalPositionEncoder : public PositionEncoder {
-    public:
-      SinusoidalPositionEncoder(dim_t depth,
-                                DataType dtype = DataType::FLOAT32,
-                                Device device = Device::CPU);
-      DataType output_type() const override;
-      dim_t output_size() const override;
-    protected:
-      const StorageView& get_position_encoding(dim_t max_time) override;
-    private:
-      StorageView _encoding;
-    };
-
     class Dense : public Layer
     {
     public:

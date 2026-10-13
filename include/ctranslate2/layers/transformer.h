@@ -3,7 +3,6 @@
 #include "ctranslate2/layers/attention.h"
 #include "ctranslate2/layers/common.h"
 #include "ctranslate2/layers/decoder.h"
-#include "ctranslate2/layers/encoder.h"
 #include "ctranslate2/padder.h"
 
 namespace ctranslate2 {
@@ -32,7 +31,6 @@ namespace ctranslate2 {
       const bool _pre_norm;
       const ops::ActivationType _activation_type;
       const Dense _ff1;
-      const std::unique_ptr<const Dense> _ff1_noact;
       const Dense _ff2;
     };
 
@@ -48,8 +46,7 @@ namespace ctranslate2 {
       void operator()(const StorageView& input,
                       const StorageView* lengths,
                       StorageView& output,
-                      const Padder* padder = nullptr,
-                      StorageView* position_bias = nullptr) const;
+                      const Padder* padder = nullptr) const;
 
       DataType output_type() const override {
         return _ff.output_type();
@@ -65,10 +62,6 @@ namespace ctranslate2 {
 
     private:
       std::unique_ptr<AttentionLayer> _self_attention;
-      const std::unique_ptr<const LayerNorm> _input_layer_norm;
-      const std::unique_ptr<const LayerNorm> _post_attention_layer_norm;
-      const std::unique_ptr<const LayerNorm> _pre_feedforward_layer_norm;
-      const std::unique_ptr<const LayerNorm> _post_feedforward_layer_norm;
       const FeedForwardNetwork _ff;
     };
 
@@ -93,9 +86,7 @@ namespace ctranslate2 {
                       StorageView* attention = nullptr,
                       const Padder* input_padder = nullptr,
                       const Padder* memory_padder = nullptr,
-                      bool return_normalized_attention = true,
-                      StorageView* position_bias = nullptr,
-                      dim_t offset = 0) const;
+                      bool return_normalized_attention = true) const;
 
       DataType output_type() const override {
         return _ff.output_type();
@@ -106,7 +97,7 @@ namespace ctranslate2 {
       }
 
       bool has_cross_attention() const {
-        return bool(_encoder_attention) || _has_merged_encoder_attention;
+        return bool(_encoder_attention);
       }
 
       const AttentionLayer& get_self_attention() const {
@@ -115,52 +106,8 @@ namespace ctranslate2 {
 
     private:
       const std::unique_ptr<AttentionLayer> _self_attention;
-      const std::unique_ptr<const LayerNorm> _shared_layer_norm;
-      const std::unique_ptr<const LayerNorm> _input_layer_norm;
-      const std::unique_ptr<const LayerNorm> _post_attention_layer_norm;
-      const std::unique_ptr<const LayerNorm> _pre_feedforward_layer_norm;
-      const std::unique_ptr<const LayerNorm> _post_feedforward_layer_norm;
       const std::unique_ptr<const AttentionLayer> _encoder_attention;
       const FeedForwardNetwork _ff;
-      const std::unique_ptr<const LayerNorm> _external_pre_encoder_attention_layer_norm;
-      const std::unique_ptr<const LayerNorm> _external_post_encoder_attention_layer_norm;
-      const float _layer_scalar;
-      const bool _has_merged_encoder_attention;
-    };
-
-    class TransformerEncoder : public Encoder
-    {
-    public:
-      TransformerEncoder(const models::Model& model, const std::string& scope);
-
-      void operator()(const std::vector<StorageView>& ids,
-                      const StorageView* lengths,
-                      StorageView& output) override;
-
-      size_t num_input_features() const override {
-        return _embeddings.num_inputs();
-      }
-
-      DataType output_type() const override {
-        return _layers.back()->output_type();
-      }
-
-      dim_t output_size() const override {
-        return _layers.back()->output_size();
-      }
-
-    private:
-      const ParallelEmbeddings _embeddings;
-      const std::unique_ptr<const StorageView> _embeddings_scale;
-      const dim_t _num_heads;
-      const ComputeType _compute_type;
-      const std::unique_ptr<const LayerNorm> _layernorm_embedding;
-      const std::unique_ptr<const LayerNorm> _output_norm;
-      const std::vector<std::unique_ptr<const TransformerEncoderLayer>> _layers;
-      const std::unique_ptr<PositionEncoder> _position_encoder;
-      // false when each layer has its own relative attention bias (e.g. UMT5), in which
-      // case the position bias is computed per layer instead of being shared.
-      const bool _shared_position_bias;
     };
 
     class TransformerDecoder : public Decoder
@@ -208,24 +155,13 @@ namespace ctranslate2 {
       const dim_t _num_heads;
       const ComputeType _compute_type;
       const Embeddings _embeddings;
-      const bool _start_from_zero_embedding;
-      const std::unique_ptr<const StorageView> _embeddings_scale;
-      std::unique_ptr<const StorageView> _outputs_scale;
-      const std::unique_ptr<const LayerNorm> _layernorm_embedding;
       const std::unique_ptr<const LayerNorm> _output_norm;
-      const std::unique_ptr<const Dense> _project_in;
-      const std::unique_ptr<const Dense> _project_out;
       const std::vector<std::unique_ptr<const TransformerDecoderLayer>> _layers;
       const std::unique_ptr<PositionEncoder> _position_encoder;
       const bool _with_encoder_attention;
       std::vector<std::vector<dim_t>> _alignment_heads;
       bool _average_alignment_heads;
       Dense _proj;
-      const dim_t _sliding_window;
-      const float _final_logit_softcapping;
-      // false when each layer has its own relative attention bias (e.g. UMT5), in which
-      // case the position bias is computed per layer instead of being shared.
-      const bool _shared_position_bias;
 
     private:
       // CUDA graphs of single decoding steps (CT2_CUDA_GRAPHS=1), see run_step_graph.
