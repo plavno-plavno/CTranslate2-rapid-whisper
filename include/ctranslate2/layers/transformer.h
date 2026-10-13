@@ -1,7 +1,6 @@
 #pragma once
 
 #include "ctranslate2/layers/attention.h"
-#include "ctranslate2/layers/flash_attention.h"
 #include "ctranslate2/layers/common.h"
 #include "ctranslate2/layers/decoder.h"
 #include "ctranslate2/layers/encoder.h"
@@ -35,7 +34,6 @@ namespace ctranslate2 {
       const Dense _ff1;
       const std::unique_ptr<const Dense> _ff1_noact;
       const Dense _ff2;
-      const bool _tensor_parallel;
     };
 
     class TransformerEncoderLayer : public Layer
@@ -45,8 +43,7 @@ namespace ctranslate2 {
                               const std::string& scope,
                               const dim_t num_heads,
                               const bool pre_norm = true,
-                              const ops::ActivationType activation_type = ops::ActivationType::ReLU,
-                              bool use_flash_attention = false);
+                              const ops::ActivationType activation_type = ops::ActivationType::ReLU);
 
       void operator()(const StorageView& input,
                       const StorageView* lengths,
@@ -83,7 +80,6 @@ namespace ctranslate2 {
                               const dim_t num_heads,
                               const bool pre_norm = true,
                               const ops::ActivationType activation_type = ops::ActivationType::ReLU,
-                              const bool use_flash_attention = true,
                               Alibi* alibi = nullptr);
 
       void operator()(const StorageView& input,
@@ -161,10 +157,8 @@ namespace ctranslate2 {
       const ComputeType _compute_type;
       const std::unique_ptr<const LayerNorm> _layernorm_embedding;
       const std::unique_ptr<const LayerNorm> _output_norm;
-      const bool _use_flash_attention;
       const std::vector<std::unique_ptr<const TransformerEncoderLayer>> _layers;
       const std::unique_ptr<PositionEncoder> _position_encoder;
-      const bool _tensor_parallel;
       // false when each layer has its own relative attention bias (e.g. UMT5), in which
       // case the position bias is computed per layer instead of being shared.
       const bool _shared_position_bias;
@@ -223,7 +217,6 @@ namespace ctranslate2 {
       const std::unique_ptr<const Dense> _project_in;
       const std::unique_ptr<const Dense> _project_out;
       const std::unique_ptr<Alibi> _alibi;
-      const bool _use_flash_attention;
       const std::vector<std::unique_ptr<const TransformerDecoderLayer>> _layers;
       const std::unique_ptr<PositionEncoder> _position_encoder;
       const bool _with_encoder_attention;
@@ -231,7 +224,6 @@ namespace ctranslate2 {
       bool _average_alignment_heads;
       Dense _proj;
       const dim_t _sliding_window;
-      const bool _tensor_parallel;
       const float _final_logit_softcapping;
       // false when each layer has its own relative attention bias (e.g. UMT5), in which
       // case the position bias is computed per layer instead of being shared.

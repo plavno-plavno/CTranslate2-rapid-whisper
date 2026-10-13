@@ -5,27 +5,20 @@
 
 #include <thrust/iterator/counting_iterator.h>
 
-#ifdef CT2_USE_HIP
-#include <hip/hip_fp16.h>
-#include <hip/hip_bf16.h>
-#include <hip/hip_fp8.h>
-#define __nv_bfloat16 __hip_bfloat16
-#else
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
-#endif
 
 #include "ctranslate2/types.h"
 
 #include "utils.h"
 
-#if !defined(__CUDACC__) || !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 530 || defined(CT2_USE_HIP)
+#if !defined(__CUDACC__) || !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 530
 #  define CUDA_CAN_USE_HALF 1
 #else
 #  define CUDA_CAN_USE_HALF 0
 #endif
 
-#if defined(__CUDACC__) && (__CUDA_ARCH__ >= 800 || !defined(__CUDA_ARCH__)) || defined(CT2_USE_HIP)
+#if defined(__CUDACC__) && (__CUDA_ARCH__ >= 800 || !defined(__CUDA_ARCH__))
 #  define CUDA_CAN_USE_BF16_MATH 1
 #else
 #  define CUDA_CAN_USE_BF16_MATH 0

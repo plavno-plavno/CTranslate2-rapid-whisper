@@ -4,9 +4,6 @@
 #include <string>
 #include <vector>
 #include <cstdint>
-#ifdef CT2_WITH_TENSOR_PARALLEL
-#  include <nccl.h>
-#endif
 
 namespace ctranslate2 {
 
@@ -50,32 +47,5 @@ namespace ctranslate2 {
     Device _device;
     int _prev_index;
     int _new_index;
-  };
-
-  extern int my_rank;
-  extern int local_rank;
-  extern int n_ranks;
-
-  class ScopedMPISetter {
-  public:
-    ScopedMPISetter();
-    ~ScopedMPISetter();
-
-    static int getNRanks();
-    static int getCurRank();
-    static int getLocalRank();
-
-#ifdef CT2_WITH_TENSOR_PARALLEL
-    static ncclComm_t getNcclComm();
-#endif
-
-    static void finalize();
-
-  private:
-#ifdef CT2_WITH_TENSOR_PARALLEL
-    static uint64_t getHostHash(const char *string);
-    static void getHostName(char *hostname, int maxlen);
-    static std::vector<ncclComm_t*> _nccl_comms;
-#endif
   };
 }

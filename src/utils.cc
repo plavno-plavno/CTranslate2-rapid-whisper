@@ -13,9 +13,6 @@
 #include "ctranslate2/devices.h"
 #include "ctranslate2/logging.h"
 
-#include "cpu/backend.h"
-#include "cpu/cpu_info.h"
-#include "cpu/cpu_isa.h"
 #include "cpu/parallel.h"
 #include "env.h"
 
@@ -30,31 +27,6 @@ namespace ctranslate2 {
 
     if (!spdlog::should_log(spdlog::level::info))
       return;
-
-#if defined(CT2_X86_BUILD)
-    spdlog::info("CPU: {} (SSE4.1={}, AVX={}, AVX2={}, AVX512={})",
-                 cpu::cpu_vendor(),
-                 cpu::cpu_supports_sse41(),
-                 cpu::cpu_supports_avx(),
-                 cpu::cpu_supports_avx2(),
-                 cpu::cpu_supports_avx512());
-#elif defined(CT2_ARM64_BUILD)
-    spdlog::info("CPU: {} (NEON={})",
-                 cpu::cpu_vendor(),
-                 cpu::cpu_supports_neon());
-#endif
-    spdlog::info(" - Selected ISA: {}", cpu::isa_to_str(cpu::get_cpu_isa()));
-    spdlog::info(" - Use Intel MKL: {}", cpu::mayiuse_mkl());
-    spdlog::info(" - SGEMM backend: {} (packed: {})",
-                 cpu::gemm_backend_to_str(cpu::get_gemm_backend(ComputeType::FLOAT32)),
-                 cpu::pack_gemm_weights(ComputeType::FLOAT32));
-    spdlog::info(" - GEMM_S16 backend: {} (packed: {})",
-                 cpu::gemm_backend_to_str(cpu::get_gemm_backend(ComputeType::INT16)),
-                 cpu::pack_gemm_weights(ComputeType::INT16));
-    spdlog::info(" - GEMM_S8 backend: {} (packed: {}, u8s8 preferred: {})",
-                 cpu::gemm_backend_to_str(cpu::get_gemm_backend(ComputeType::INT8)),
-                 cpu::pack_gemm_weights(ComputeType::INT8),
-                 cpu::prefer_u8s8s32_gemm());
 
 #ifdef CT2_WITH_CUDA
     for (int i = 0; i < cuda::get_gpu_count(); ++i) {
@@ -92,9 +64,6 @@ namespace ctranslate2 {
     cpu::set_num_threads(num_threads);
 #endif
 
-#ifdef CT2_WITH_RUY
-    cpu::get_ruy_context()->set_max_num_threads(num_threads);
-#endif
   }
 
   std::istream& getline(std::istream& input, std::string& str, bool remove_carriage_return) {

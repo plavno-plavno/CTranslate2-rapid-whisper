@@ -1,11 +1,6 @@
 #include "ctranslate2/ops/topp_mask.h"
 
-#ifdef CT2_USE_HIP
-#include <hipcub/block/block_radix_sort.hpp>
-#define cub hipcub
-#else
 #include <cub/block/block_radix_sort.cuh>
-#endif
 
 #include "cuda/helpers.h"
 

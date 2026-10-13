@@ -1,33 +1,7 @@
 #include "ctranslate2/primitives.h"
 
-#ifdef CT2_USE_HIP
-#include <hip/hip_runtime.h>
-#include <hipblas/hipblas.h>
-#include <thrust/extrema.h>
-#define cudaMemcpyAsync hipMemcpyAsync
-#define cudaMemcpyDeviceToDevice hipMemcpyDeviceToDevice
-#define cudaMemcpyDeviceToHost hipMemcpyDeviceToHost
-#define cudaMemcpyHostToDevice hipMemcpyHostToDevice
-#define cublasSgemm hipblasSgemm
-#define CUBLAS_OP_T HIPBLAS_OP_T
-#define CUBLAS_OP_N HIPBLAS_OP_N
-#define cublasComputeType_t hipblasComputeType_t
-#define CUBLAS_COMPUTE_16F HIPBLAS_COMPUTE_16F
-#define CUBLAS_COMPUTE_32F HIPBLAS_COMPUTE_32F
-#define CUBLAS_COMPUTE_32I HIPBLAS_COMPUTE_32I
-#define CUDA_R_16F HIP_R_16F
-#define CUDA_R_16BF HIP_R_16BF
-#define CUDA_R_32F HIP_R_32F
-#define CUDA_R_8I HIP_R_8I
-#define CUDA_R_32I HIP_R_32I
-#define CUBLAS_GEMM_DEFAULT HIPBLAS_GEMM_DEFAULT
-#define cublasSgemmStridedBatched hipblasSgemmStridedBatched
-#define cublasGemmEx hipblasGemmEx
-#define cublasGemmStridedBatchedEx hipblasGemmStridedBatchedEx
-#else
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
-#endif
 #include <thrust/device_ptr.h>
 #include <thrust/extrema.h>
 #include <thrust/reduce.h>

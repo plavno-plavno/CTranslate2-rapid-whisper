@@ -250,14 +250,6 @@ namespace ctranslate2 {
                                                  with_cache ? key_length - 1 : 0);
         }
         StorageView* position_bias_per_gpu = position_bias;
-        StorageView position_bias_tmp(position_bias->dtype(), position_bias->device());
-        if (ScopedMPISetter::getCurRank() != 0) {
-          const dim_t num_head_per_gpu = SAFE_DIVIDE(position_bias->dim(0), ScopedMPISetter::getNRanks());
-          ops::Slide slide_ops(0, num_head_per_gpu * ScopedMPISetter::getCurRank(),
-                               num_head_per_gpu, true);
-          slide_ops(*position_bias, position_bias_tmp);
-          position_bias_per_gpu = &position_bias_tmp;
-        }
 
         DEVICE_AND_TYPE_DISPATCH(output.device(), output.dtype(),
                                  primitives<D>::add_batch_broadcast(position_bias_per_gpu->data<T>(),
@@ -306,7 +298,7 @@ namespace ctranslate2 {
                                            bool pre_norm,
                                            bool is_decoder,
                                            Alibi* alibi)
-      : AttentionLayer(model, scope, num_heads, self_attention, pre_norm, is_decoder, alibi, false)
+      : AttentionLayer(model, scope, num_heads, self_attention, pre_norm, is_decoder, alibi)
       , _relative_attention_bias(model.get_variable_if_exists(scope + "/relative_attention_bias"))
       , _relative_position_keys(model.get_variable_if_exists(scope + "/relative_position_keys"))
       , _relative_asymmetric_position_keys(model.get_variable_if_exists(scope + "/relative_asymmetric_position_keys"))
@@ -615,13 +607,6 @@ namespace ctranslate2 {
       }
       _linear.back()(context, output, _layer_norm ? &queries : nullptr);
 
-      if (_tensor_parallel) {
-        Shape shape = output.shape();
-        StorageView tmp(std::move(shape), output.dtype(), output.device());
-        ops::ReduceAll ops_reduce_all(ops::ReduceAll::RED_OP::SUM);
-        ops_reduce_all(output, tmp);
-        output = std::move(tmp);
-      }
       if (_layer_norm && !_pre_norm)
         (*_layer_norm)(output, output);
     }

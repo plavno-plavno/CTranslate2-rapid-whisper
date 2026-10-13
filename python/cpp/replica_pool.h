@@ -58,8 +58,10 @@ namespace ctranslate2 {
         _model_loader.device_indices = std::visit(DeviceIndexResolver(), device_index);
         _model_loader.compute_type = std::visit(ComputeTypeResolver(device), compute_type);
         _model_loader.num_replicas_per_device = inter_threads;
-        _model_loader.use_flash_attention = flash_attention;
-        _model_loader.tensor_parallel = tensor_parallel;
+        if (flash_attention)
+          throw std::invalid_argument("This Whisper-only build does not include FlashAttention");
+        if (tensor_parallel)
+          throw std::invalid_argument("This Whisper-only build does not include tensor parallelism");
 
         _pool_config.num_threads_per_replica = intra_threads;
         _pool_config.max_queued_batches = max_queued_batches;
@@ -87,7 +89,7 @@ namespace ctranslate2 {
       }
 
       bool tensor_parallel() const {
-        return _model_loader.tensor_parallel;
+        return false;
       }
 
       size_t num_replicas() const {

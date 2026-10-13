@@ -159,13 +159,7 @@ namespace ctranslate2 {
   POSSIBILITY OF SUCH DAMAGE.
 */
 
-#ifdef CT2_USE_HIP
-#include <hipcub/hipcub.hpp>
-#include <hipcub/block/block_reduce.hpp>
-#define cub hipcub
-#else
 #include <cub/block/block_reduce.cuh>
-#endif
 
 namespace at {
   namespace native {

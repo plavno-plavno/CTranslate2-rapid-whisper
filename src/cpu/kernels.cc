@@ -2,22 +2,8 @@
 
 #include <limits>
 
-#if defined(__AVX512F__)
-#  define TARGET_ISA CpuIsa::AVX512
-#  include "cpu/vec_avx512.h"
-#elif defined(__AVX2__)
-#  define TARGET_ISA CpuIsa::AVX2
-#  include "cpu/vec_avx.h"
-#elif defined(__AVX__)
-#  define TARGET_ISA CpuIsa::AVX
-#  include "cpu/vec_avx.h"
-#elif (defined(__ARM_NEON) && !defined(CT2_WITH_CPU_DISPATCH)) || defined(USE_NEON)
-#  define TARGET_ISA CpuIsa::NEON
-#  include "cpu/vec_neon.h"
-#else
-#  define TARGET_ISA CpuIsa::GENERIC
-#  include "cpu/vec.h"
-#endif
+#define TARGET_ISA CpuIsa::GENERIC
+#include "cpu/vec.h"
 
 // Associative arithmetic is required for the compiler to automatically vectorize loops.
 // With GCC this can be minimally enabled with -fassociative-math but this flag is not

@@ -25,8 +25,7 @@ namespace ctranslate2 {
       , _activation_type(activation_type)
       , _ff1(model, scope + "/linear_0", &_activation_type)
       , _ff1_noact(build_optional_layer<Dense>(model, scope + "/linear_0_noact"))
-      , _ff2(model, scope + "/linear_1", nullptr, true)
-      , _tensor_parallel(model.tensor_parallel()) {
+      , _ff2(model, scope + "/linear_1") {
     }
 
     void FeedForwardNetwork::operator()(const StorageView& input, StorageView& output) const {
@@ -49,14 +48,6 @@ namespace ctranslate2 {
 
       _ff2(inner, output, _layer_norm ? &input : nullptr);
 
-      if (_tensor_parallel) {
-        Shape shape = output.shape();
-        StorageView tmp(std::move(shape), output.dtype(), output.device());
-        ops::ReduceAll red_op(ops::ReduceAll::RED_OP::SUM);
-        red_op(output, tmp);
-        output = std::move(tmp);
-      }
-
       if (_layer_norm && !_pre_norm)
         (*_layer_norm)(output, output);
     }
@@ -66,13 +57,8 @@ namespace ctranslate2 {
                                                      const std::string& scope,
                                                      const dim_t num_heads,
                                                      const bool pre_norm,
-                                                     const ops::ActivationType activation_type,
-                                                     const bool use_flash_attention)
-      : _self_attention(!use_flash_attention ? std::unique_ptr<AttentionLayer>(new MultiHeadAttention(model,
-                        scope + "/self_attention",
-                        num_heads,
-                        /*self_attention=*/true,
-                        pre_norm)) : std::unique_ptr<AttentionLayer>(new FlashMultiHeadAttention(model,
+                                                     const ops::ActivationType activation_type)
+      : _self_attention(std::unique_ptr<AttentionLayer>(new MultiHeadAttention(model,
                         scope + "/self_attention",
                         num_heads,
                         /*self_attention=*/true,
@@ -163,15 +149,8 @@ namespace ctranslate2 {
                                                      const dim_t num_heads,
                                                      const bool pre_norm,
                                                      const ops::ActivationType activation_type,
-                                                     const bool use_flash_attention,
                                                      Alibi* alibi)
-      : _self_attention(!use_flash_attention ? std::unique_ptr<AttentionLayer>(new MultiHeadAttention(model,
-                        scope + "/self_attention",
-                        num_heads,
-                        /*self_attention=*/true,
-                        pre_norm,
-                        /*is_decoder=*/true,
-                        alibi)) : std::unique_ptr<AttentionLayer>(new FlashMultiHeadAttention(model,
+      : _self_attention(std::unique_ptr<AttentionLayer>(new MultiHeadAttention(model,
                         scope + "/self_attention",
                         num_heads,
                         /*self_attention=*/true,
@@ -199,8 +178,7 @@ namespace ctranslate2 {
                                      model, scope + "/external_post_encoder_attention_layer_norm"))
       , _layer_scalar(model.get_attribute_with_default<float>(scope + "/layer_scalar", 1.f))
       , _has_merged_encoder_attention(
-          !use_flash_attention
-          && static_cast<MultiHeadAttention*>(_self_attention.get())->has_merged_encoder_attention())
+          static_cast<MultiHeadAttention*>(_self_attention.get())->has_merged_encoder_attention())
       {
     }
 
@@ -445,7 +423,6 @@ namespace ctranslate2 {
       , _compute_type(model.effective_compute_type())
       , _layernorm_embedding(build_optional_layer<LayerNorm>(model, scope + "/layernorm_embedding"))
       , _output_norm(build_optional_layer<LayerNorm>(model, scope + "/layer_norm"))
-      , _use_flash_attention(model.use_flash_attention())
       , _layers(build_layers_list<const TransformerEncoderLayer>(
                   model,
                   scope + "/layer",
@@ -455,7 +432,6 @@ namespace ctranslate2 {
       , _position_encoder(_layers.front()->get_self_attention().has_positional_embeddings()
                           ? nullptr
                           : build_position_encoder(model, scope + "/position_encodings", _embeddings))
-      , _tensor_parallel(model.tensor_parallel())
       , _shared_position_bias(has_shared_position_bias(model, scope, _layers.size()))
     {
     }
@@ -486,9 +462,6 @@ namespace ctranslate2 {
         }
 
         int num_heads = _num_heads;
-        if (_tensor_parallel) {
-          num_heads = SAFE_DIVIDE(num_heads, ScopedMPISetter::getNRanks());
-        }
         lengths_mask = std::make_unique<StorageView>(
           layers::MultiHeadAttention::prepare_length_mask(*lengths, num_heads, max_time));
       }
@@ -534,14 +507,12 @@ namespace ctranslate2 {
       , _project_in(build_optional_layer<Dense>(model, scope + "/project_in"))
       , _project_out(build_optional_layer<Dense>(model, scope + "/project_out"))
       , _alibi(make_alibi(model, scope))
-      , _use_flash_attention(model.use_flash_attention())
       , _layers(build_layers_list<const TransformerDecoderLayer>(
                   model,
                   scope + "/layer",
                   _num_heads,
                   model.get_flag_with_default(scope + "/pre_norm", true),
                   model.get_enum_value<ops::ActivationType>(scope + "/activation"),
-                  _use_flash_attention,
                   _alibi.get()))
       , _position_encoder(_layers.front()->get_self_attention().has_positional_embeddings()
                           ? nullptr
@@ -549,7 +520,6 @@ namespace ctranslate2 {
       , _with_encoder_attention(_layers.front()->has_cross_attention())
       , _proj(model, scope + "/projection")
       , _sliding_window(model.get_attribute_with_default<int32_t>(scope + "/sliding_window", 0))
-      , _tensor_parallel(model.tensor_parallel())
       , _final_logit_softcapping(model.get_attribute_with_default<float>(scope + "/final_logit_softcapping", 0.f))
       , _shared_position_bias(has_shared_position_bias(model, scope, _layers.size())) {
 
@@ -819,7 +789,7 @@ namespace ctranslate2 {
       StepGraphs& graphs = *_step_graphs;
       if (graphs.disabled)
         return false;
-      if (_sliding_window > 0 || _use_flash_attention || _tensor_parallel || _alibi)
+      if (_sliding_window > 0 || _alibi)
         return false;
 
       if (graphs.output_layer_version != output_layer_version()) {
@@ -1188,9 +1158,6 @@ namespace ctranslate2 {
         }
 
         dim_t num_heads = _num_heads;
-        if (_tensor_parallel) {
-          num_heads = SAFE_DIVIDE(num_heads, ScopedMPISetter::getNRanks());
-        }
 
         StorageView lengths_mask = layers::MultiHeadAttention::prepare_length_mask(
           *lengths,
@@ -1224,9 +1191,6 @@ namespace ctranslate2 {
 
         if (memory_lengths) {
           dim_t num_heads = _num_heads;
-          if (_tensor_parallel) {
-            num_heads = SAFE_DIVIDE(num_heads, ScopedMPISetter::getNRanks());
-          }
           const dim_t beam_size = batch_size / memory_lengths->dim(0);
           memory_lengths_mask = std::make_unique<StorageView>(
             layers::MultiHeadAttention::prepare_length_mask(*memory_lengths,
@@ -1246,7 +1210,7 @@ namespace ctranslate2 {
 
       while (true) {
         dim_t prompt_size = layer_in.dim(1);
-        if (_sliding_window == 0 || prompt_size <= _sliding_window || _use_flash_attention) {
+        if (_sliding_window == 0 || prompt_size <= _sliding_window) {
           layer_ins.push_back(std::move(layer_in));
           break;
         }
@@ -1287,9 +1251,6 @@ namespace ctranslate2 {
             auto max_tokens = _sliding_window + layer_in_chunk->dim(1);
             StorageView tmp_lengths = StorageView(Shape{layer_in_chunk->dim(0)}, int32_t(max_tokens), device);
             int num_heads = _num_heads;
-            if (_tensor_parallel) {
-              num_heads = SAFE_DIVIDE(num_heads, ScopedMPISetter::getNRanks());
-            }
             StorageView lengths_mask = layers::MultiHeadAttention::prepare_length_mask(
               tmp_lengths,
               num_heads,

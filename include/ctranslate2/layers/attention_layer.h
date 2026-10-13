@@ -32,8 +32,7 @@ namespace ctranslate2 {
                          bool self_attention,
                          bool pre_norm = true,
                          bool is_decoder = false,
-                         Alibi* alibi = nullptr,
-                         bool is_flash_attn = false);
+                         Alibi* alibi = nullptr);
       virtual ~AttentionLayer() {};
       DataType output_type() const override;
       dim_t output_size() const override;
@@ -63,7 +62,6 @@ namespace ctranslate2 {
                                              const bool multi_query = false);
 
     protected:
-      const bool _tensor_parallel;
       const dim_t _num_heads;
       const bool _self_attention;
       const bool _is_decoder;

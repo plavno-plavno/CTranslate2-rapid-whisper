@@ -7,24 +7,9 @@
 #include "cuda/utils.h"
 #include "env.h"
 
-#ifdef CT2_USE_HIP
-#include <hip/hip_runtime.h>
-#include <hipcub/util_allocator.hpp>
-#define cub hipcub
-#define cudaGetDevice hipGetDevice
-#define cudaSetDevice hipSetDevice
-#define cudaFreeAsync hipFreeAsync
-#define cudaMallocAsync hipMallocAsync
-#define cudaDeviceGetAttribute hipDeviceGetAttribute
-#define cudaDevAttrMemoryPoolsSupported hipDeviceAttributeMemoryPoolsSupported
-// Async allocactor has crashing issues on Windows
-// https://github.com/OpenNMT/CTranslate2/issues/1072#issuecomment-3418768140
-#define CT2_USE_ASYNC_ALLOC !_WIN32
-#else
 #include <cuda.h>
 #include <cub/util_allocator.cuh>
 #define CT2_USE_ASYNC_ALLOC CUDA_VERSION >= 11020
-#endif
 #include <spdlog/spdlog.h>
 
 namespace ctranslate2 {

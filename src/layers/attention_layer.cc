@@ -58,10 +58,7 @@ namespace ctranslate2 {
       std::vector<Dense> layers;
       layers.reserve(num_linear_layers);
       for (dim_t i = 0; i < num_linear_layers; ++i)
-        if (i == (num_linear_layers - 1)) {
-          layers.emplace_back(model, scope + "/linear_" + std::to_string(i), nullptr, true);
-        } else
-          layers.emplace_back(model, scope + "/linear_" + std::to_string(i));
+        layers.emplace_back(model, scope + "/linear_" + std::to_string(i));
       return layers;
     }
 
@@ -115,18 +112,16 @@ namespace ctranslate2 {
                                            bool self_attention,
                                            bool pre_norm,
                                            bool is_decoder,
-                                           Alibi* alibi,
-                                           bool is_flash_attn)
-      : _tensor_parallel(model.tensor_parallel())
-      , _num_heads(_tensor_parallel ? SAFE_DIVIDE(num_heads, ScopedMPISetter::getNRanks()) : num_heads)
+                                           Alibi* alibi)
+      : _num_heads(num_heads)
       , _self_attention(self_attention)
       , _is_decoder(is_decoder)
       , _linear(make_linear_layers(model, scope, self_attention))
-      , _d_model(_tensor_parallel ? SAFE_DIVIDE(_linear.back().output_size(),  ScopedMPISetter::getNRanks()) : _linear.back().output_size())
+      , _d_model(_linear.back().output_size())
       , _d_head(model.get_attribute_with_default<int32_t >(scope + "/head_dim", _d_model / _num_heads))
       , _pre_norm(pre_norm)
       , _layer_norm(build_optional_layer<LayerNorm>(model, scope + "/layer_norm"))
-      , _rotary_embeddings(make_rotary_embeddings(model, scope, !is_flash_attn))
+      , _rotary_embeddings(make_rotary_embeddings(model, scope, /*transpose=*/true))
       , _alibi(alibi)
       , _queries_scale(model.get_attribute_with_default<float>(
                          scope + "/queries_scale",
@@ -134,9 +129,7 @@ namespace ctranslate2 {
       , _multi_query(model.get_flag_with_default(scope + "/multi_query", false))
       , _num_heads_kv(_multi_query
                       ? 1
-                      : (_tensor_parallel ? model.get_attribute_with_default<int32_t>(scope + "/num_heads_kv",
-                                            _num_heads * ScopedMPISetter::getNRanks()) / ScopedMPISetter::getNRanks()
-                      : model.get_attribute_with_default<int32_t>(scope + "/num_heads_kv", _num_heads)))
+                      : model.get_attribute_with_default<int32_t>(scope + "/num_heads_kv", _num_heads))
       , _sliding_window(model.get_attribute_with_default<int32_t>(scope + "/sliding_window", 0))
     {
     }
