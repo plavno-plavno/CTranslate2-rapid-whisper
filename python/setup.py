@@ -25,7 +25,7 @@ def _get_project_version():
     version = {}
     with open(version_path, encoding="utf-8") as fp:
         exec(fp.read(), version)
-    return version["__version__"]
+    return version["rapido_version"]
 
 
 def _maybe_add_library_root(lib_name):
@@ -68,14 +68,17 @@ ctranslate2_module = Extension(
 ParallelCompile("CMAKE_BUILD_PARALLEL_LEVEL").install()
 
 setup(
-    name="ctranslate2",
+    name="rapido-whisper",
     version=_get_project_version(),
     license="MIT",
-    description="Fast inference engine for Transformer models",
+    description=(
+        "rapido-whisper: Whisper-only CTranslate2 engine for NVIDIA GPUs "
+        "(import ctranslate2; faster-whisper and CrisperWhisper compatible)"
+    ),
     long_description=_get_long_description(),
     long_description_content_type="text/markdown",
-    author="OpenNMT",
-    url="https://opennmt.net",
+    author="Plavno (based on OpenNMT CTranslate2)",
+    url="https://github.com/plavno-plavno/CTranslate2-rapid-whisper",
     classifiers=[
         "Development Status :: 5 - Production/Stable",
         "Environment :: GPU :: NVIDIA CUDA :: 12 :: 12.4",
@@ -92,12 +95,10 @@ setup(
         "Topic :: Scientific/Engineering :: Artificial Intelligence",
     ],
     project_urls={
-        "Documentation": "https://opennmt.net/CTranslate2",
-        "Forum": "https://forum.opennmt.net",
-        "Gitter": "https://gitter.im/OpenNMT/CTranslate2",
-        "Source": "https://github.com/OpenNMT/CTranslate2",
+        "Source": "https://github.com/plavno-plavno/CTranslate2-rapid-whisper",
+        "Upstream": "https://github.com/OpenNMT/CTranslate2",
     },
-    keywords="opennmt nmt neural machine translation cuda mkl inference quantization",
+    keywords="whisper speech recognition asr cuda inference ctranslate2",
     packages=find_packages(exclude=["bin"]),
     package_data=package_data,
     ext_modules=[ctranslate2_module],
