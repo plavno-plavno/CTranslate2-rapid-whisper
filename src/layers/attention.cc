@@ -198,7 +198,6 @@ namespace ctranslate2 {
                                       bool is_decoder = false,
                                       bool with_cache = false,
                                       dim_t beam_size = 1,
-                                      Alibi* alibi = nullptr,
                                       StorageView* position_bias = nullptr) {
       PROFILE("dot_product_attention");
 
@@ -258,9 +257,6 @@ namespace ctranslate2 {
                                                                     output.size()));
       }
 
-      if (alibi)
-        alibi->apply(output, queries_scale);
-
       StorageView attn(values.dtype(), values.device());
       if (attention && !return_normalized_attention) {
         ops::SoftMax()(output, values_lengths, attn);
@@ -296,9 +292,8 @@ namespace ctranslate2 {
                                            dim_t num_heads,
                                            bool self_attention,
                                            bool pre_norm,
-                                           bool is_decoder,
-                                           Alibi* alibi)
-      : AttentionLayer(model, scope, num_heads, self_attention, pre_norm, is_decoder, alibi)
+                                           bool is_decoder)
+      : AttentionLayer(model, scope, num_heads, self_attention, pre_norm, is_decoder)
       , _relative_attention_bias(model.get_variable_if_exists(scope + "/relative_attention_bias"))
       , _relative_position_keys(model.get_variable_if_exists(scope + "/relative_position_keys"))
       , _relative_asymmetric_position_keys(model.get_variable_if_exists(scope + "/relative_asymmetric_position_keys"))
@@ -515,21 +510,6 @@ namespace ctranslate2 {
           apply_v_norm(values_proj);
         }
 
-        if (_rotary_embeddings) {
-          if (_merge_time_and_head_dims) {
-            queries_proj.reshape({queries_proj.dim(0), -1, _d_model});
-            split_heads(queries_proj, _num_heads);
-          }
-
-          _rotary_embeddings->apply(queries_proj, offset);
-          _rotary_embeddings->apply(keys_proj, offset);
-
-          if (_merge_time_and_head_dims) {
-            combine_heads(queries_proj, _num_heads);
-            queries_proj.reshape({queries_proj.dim(0), -1, _d_head});
-          }
-        }
-
         if (cached_keys != nullptr) {
           SelfAttentionCacheTarget* target = self_attention_cache_target();
           if (cached_keys->empty()) {
@@ -585,7 +565,6 @@ namespace ctranslate2 {
                             _is_decoder,
                             bool(cached_keys),
                             beam_size,
-                            _alibi,
                             position_bias);
 
       if (prefilling && cached_keys && cached_keys->shape()[2] > _sliding_window) {
@@ -668,11 +647,6 @@ namespace ctranslate2 {
         ops::Split(1)(fused_proj, queries_proj, keys_proj, values_proj);
         apply_qk_norm(queries_proj, keys_proj);
         apply_v_norm(values_proj);
-      }
-
-      if (_rotary_embeddings) {
-        _rotary_embeddings->apply(queries_proj, offset);
-        _rotary_embeddings->apply(keys_proj, offset);
       }
 
       // Update self-attention KV cache.

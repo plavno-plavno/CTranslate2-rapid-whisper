@@ -79,8 +79,7 @@ namespace ctranslate2 {
                               const std::string& scope,
                               const dim_t num_heads,
                               const bool pre_norm = true,
-                              const ops::ActivationType activation_type = ops::ActivationType::ReLU,
-                              Alibi* alibi = nullptr);
+                              const ops::ActivationType activation_type = ops::ActivationType::ReLU);
 
       void operator()(const StorageView& input,
                       const StorageView* input_lengths,
@@ -216,7 +215,6 @@ namespace ctranslate2 {
       const std::unique_ptr<const LayerNorm> _output_norm;
       const std::unique_ptr<const Dense> _project_in;
       const std::unique_ptr<const Dense> _project_out;
-      const std::unique_ptr<Alibi> _alibi;
       const std::vector<std::unique_ptr<const TransformerDecoderLayer>> _layers;
       const std::unique_ptr<PositionEncoder> _position_encoder;
       const bool _with_encoder_attention;

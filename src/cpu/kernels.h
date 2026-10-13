@@ -91,14 +91,6 @@ namespace ctranslate2 {
                          dim_t inner_size,
                          float epsilon);
 
-    template <CpuIsa ISA>
-    void rms_norm(const float* input,
-                  const float* gamma,
-                  float* output,
-                  dim_t batch_size,
-                  dim_t depth,
-                  float epsilon,
-                  bool use_residual);
 
     struct identity {
       template <typename T>

@@ -16,9 +16,6 @@ namespace ctranslate2 {
                                                    dim_t left_max_position,
                                                    dim_t right_max_position);
 
-    class RotaryEmbeddings;
-    class Alibi;
-
     class MultiHeadAttention : public AttentionLayer
     {
     public:
@@ -27,8 +24,7 @@ namespace ctranslate2 {
                          dim_t num_heads,
                          bool self_attention,
                          bool pre_norm = true,
-                         bool is_decoder = false,
-                         Alibi* alibi = nullptr);
+                         bool is_decoder = false);
       DataType output_type() const override;
       dim_t output_size() const override;
       virtual void operator()(const StorageView& queries,
@@ -45,7 +41,7 @@ namespace ctranslate2 {
                       dim_t offset = 0) const override;
 
       virtual bool has_positional_embeddings() const override {
-            return _relative_position_keys || _relative_attention_bias || _rotary_embeddings || _alibi;
+            return _relative_position_keys || _relative_attention_bias;
       }
 
       bool has_merged_encoder_attention() const {

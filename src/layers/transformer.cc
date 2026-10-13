@@ -148,15 +148,13 @@ namespace ctranslate2 {
                                                      const std::string& scope,
                                                      const dim_t num_heads,
                                                      const bool pre_norm,
-                                                     const ops::ActivationType activation_type,
-                                                     Alibi* alibi)
+                                                     const ops::ActivationType activation_type)
       : _self_attention(std::unique_ptr<AttentionLayer>(new MultiHeadAttention(model,
                         scope + "/self_attention",
                         num_heads,
                         /*self_attention=*/true,
                         pre_norm,
-                        /*is_decoder=*/true,
-                        alibi)))
+                        /*is_decoder=*/true)))
       , _shared_layer_norm(build_optional_layer<LayerNorm>(model, scope + "/shared_layer_norm"))
       , _input_layer_norm(build_optional_layer<LayerNorm>(model, scope + "/input_layer_norm"))
       , _post_attention_layer_norm(build_optional_layer<LayerNorm>(
@@ -481,19 +479,6 @@ namespace ctranslate2 {
     }
 
 
-    static std::unique_ptr<Alibi> make_alibi(const models::Model& model, const std::string& scope) {
-      const bool use_alibi = model.get_flag_with_default(scope + "/alibi", false);
-      if (!use_alibi)
-        return nullptr;
-
-      const bool use_positive_positions = model.get_flag_with_default(
-        scope + "/alibi_use_positive_positions", true);
-      const bool scale_alibi = model.get_flag_with_default(
-        scope + "/scale_alibi", false);
-
-      return std::make_unique<Alibi>(use_positive_positions, scale_alibi);
-    }
-
     TransformerDecoder::TransformerDecoder(const models::Model& model, const std::string& scope)
       : Decoder(model.device())
       , _num_heads(model.get_attribute_with_default<int32_t>(scope + "/num_heads", 8))
@@ -506,14 +491,12 @@ namespace ctranslate2 {
       , _output_norm(build_optional_layer<LayerNorm>(model, scope + "/layer_norm"))
       , _project_in(build_optional_layer<Dense>(model, scope + "/project_in"))
       , _project_out(build_optional_layer<Dense>(model, scope + "/project_out"))
-      , _alibi(make_alibi(model, scope))
       , _layers(build_layers_list<const TransformerDecoderLayer>(
                   model,
                   scope + "/layer",
                   _num_heads,
                   model.get_flag_with_default(scope + "/pre_norm", true),
-                  model.get_enum_value<ops::ActivationType>(scope + "/activation"),
-                  _alibi.get()))
+                  model.get_enum_value<ops::ActivationType>(scope + "/activation")))
       , _position_encoder(_layers.front()->get_self_attention().has_positional_embeddings()
                           ? nullptr
                           : build_position_encoder(model, scope + "/position_encodings", _embeddings))
@@ -789,7 +772,7 @@ namespace ctranslate2 {
       StepGraphs& graphs = *_step_graphs;
       if (graphs.disabled)
         return false;
-      if (_sliding_window > 0 || _alibi)
+      if (_sliding_window > 0)
         return false;
 
       if (graphs.output_layer_version != output_layer_version()) {

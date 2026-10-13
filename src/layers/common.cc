@@ -290,7 +290,7 @@ namespace ctranslate2 {
     LayerNorm::LayerNorm(const models::Model& model, const std::string& scope)
       : _beta(model.get_variable_if_exists(scope + "/beta"))
       , _gamma(model.get_variable(scope + "/gamma"))
-      , _use_residual(model.get_flag_with_default((scope + "/layer_norm_use_residual"), false)) {
+    {
       auto epsilon_it = model.config.find("layer_norm_epsilon");
       if (epsilon_it == model.config.end() || epsilon_it->is_null())
         _epsilon = _beta ? 1e-5 : 1e-6;
@@ -307,13 +307,10 @@ namespace ctranslate2 {
     }
 
     void LayerNorm::operator()(const StorageView& input, StorageView& output) const {
-      if (_beta) {
-        const ops::LayerNorm norm_op(-1, _epsilon);
-        norm_op(*_beta, _gamma, input, output);
-      } else {
-        const ops::RMSNorm norm_op(_epsilon, _use_residual);
-        norm_op(_gamma, input, output);
-      }
+      if (!_beta)
+        throw std::runtime_error("LayerNorm without beta (RMSNorm) is not supported by this build");
+      const ops::LayerNorm norm_op(-1, _epsilon);
+      norm_op(*_beta, _gamma, input, output);
     }
 
 

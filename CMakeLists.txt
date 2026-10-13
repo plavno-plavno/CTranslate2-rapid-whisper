@@ -107,8 +107,6 @@ set(SOURCES
   src/models/whisper.cc
   src/ops/activation.cc
   src/ops/add.cc
-  src/ops/alibi_add.cc
-  src/ops/alibi_add_cpu.cc
   src/ops/bias_add.cc
   src/ops/bias_add_cpu.cc
   src/ops/concat.cc
@@ -130,21 +128,15 @@ set(SOURCES
   src/ops/mean_cpu.cc
   src/ops/median_filter.cc
   src/ops/median_filter_cpu.cc
-  src/ops/min_max.cc
   src/ops/mul.cc
   src/ops/multinomial.cc
   src/ops/multinomial_cpu.cc
   src/ops/relu.cc
-  src/ops/rms_norm.cc
-  src/ops/rms_norm_cpu.cc
-  src/ops/rotary.cc
-  src/ops/rotary_cpu.cc
   src/ops/sin.cc
   src/ops/softmax.cc
   src/ops/softmax_cpu.cc
   src/ops/split.cc
   src/ops/slide.cc
-  src/ops/sub.cc
   src/ops/sigmoid.cc
   src/ops/swish.cc
   src/ops/tanh.cc
@@ -171,7 +163,6 @@ set(CUDA_SOURCES
   src/cuda/primitives.cu
   src/cuda/random.cu
   src/cuda/utils.cc
-  src/ops/alibi_add_gpu.cu
   src/ops/bias_add_gpu.cu
   src/ops/concat_split_slide_gpu.cu
   src/ops/conv1d_gpu.cu
@@ -181,8 +172,6 @@ set(CUDA_SOURCES
   src/ops/mean_gpu.cu
   src/ops/median_filter_gpu.cu
   src/ops/multinomial_gpu.cu
-  src/ops/rms_norm_gpu.cu
-  src/ops/rotary_gpu.cu
   src/ops/softmax_gpu.cu
   src/ops/tile_gpu.cu
   src/ops/topk_gpu.cu
