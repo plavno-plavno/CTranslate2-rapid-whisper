@@ -78,15 +78,5 @@ PYBIND11_MODULE(_ext, m)
 
   ctranslate2::python::register_logging(m);
   ctranslate2::python::register_storage_view(m);
-  ctranslate2::python::register_translation_stats(m);
-  ctranslate2::python::register_translation_result(m);
-  ctranslate2::python::register_scoring_result(m);
-  ctranslate2::python::register_generation_result(m);
-  ctranslate2::python::register_translator(m);
-  ctranslate2::python::register_generator(m);
-  ctranslate2::python::register_encoder(m);
   ctranslate2::python::register_whisper(m);
-  ctranslate2::python::register_wav2vec2(m);
-  ctranslate2::python::register_wav2vec2bert(m);
-  ctranslate2::python::register_mpi(m);
 }

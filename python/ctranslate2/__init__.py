@@ -30,32 +30,15 @@ if sys.platform == "win32":
 
 try:
     from ctranslate2._ext import (
-        AsyncGenerationResult,
-        AsyncScoringResult,
-        AsyncTranslationResult,
         DataType,
         Device,
-        Encoder,
-        EncoderForwardOutput,
-        ExecutionStats,
-        GenerationResult,
-        GenerationStepResult,
-        Generator,
-        MpiInfo,
-        ScoringResult,
         StorageView,
-        TranslationResult,
-        Translator,
         contains_model,
         get_cuda_device_count,
         get_supported_compute_types,
         set_random_seed,
     )
-    from ctranslate2.extensions import register_extensions
     from ctranslate2.logging import get_log_level, set_log_level
-
-    register_extensions()
-    del register_extensions
 except ImportError as e:
     # Allow using the Python package without the compiled extension.
     if "No module named" in str(e):

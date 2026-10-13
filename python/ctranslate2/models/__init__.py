@@ -1,11 +1,7 @@
-"""A collection of models which don't fit in the generic classes :class:`ctranslate2.Translator`
-and :class:`ctranslate2.Generator`.
-"""
+"""Whisper speech recognition model."""
 
 try:
     from ctranslate2._ext import (
-        Wav2Vec2,
-        Wav2Vec2Bert,
         Whisper,
         WhisperGenerationResult,
         WhisperGenerationResultAsync,

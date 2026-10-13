@@ -18,8 +18,6 @@ option(WITH_HIP "Compile with AMD HIP GPU backend" OFF)
 option(CUDA_DYNAMIC_LOADING "Dynamically load CUDA libraries at runtime" OFF)
 option(ENABLE_CPU_DISPATCH "Compile CPU kernels for multiple ISA and dispatch at runtime" ON)
 option(ENABLE_PROFILING "Compile with profiling support" OFF)
-option(BUILD_CLI "Compile the clients" ON)
-option(BUILD_TESTS "Compile the tests" OFF)
 option(BUILD_SHARED_LIBS "Build shared libraries" ON)
 option(WITH_TENSOR_PARALLEL "Compile with NCCL and MPI backend" OFF)
 option(WITH_FLASH_ATTN "Compile with Flash Attention 2" OFF)
@@ -115,7 +113,6 @@ set(PRIVATE_INCLUDE_DIRECTORIES
 set(SOURCES
   src/allocator.cc
   src/batch_reader.cc
-  src/buffered_translation_wrapper.cc
   src/cpu/allocator.cc
   src/cpu/backend.cc
   src/cpu/cpu_info.cc
@@ -127,28 +124,19 @@ set(SOURCES
   src/decoding_utils.cc
   src/devices.cc
   src/dtw.cc
-  src/encoder.cc
   src/env.cc
   src/filesystem.cc
-  src/generator.cc
   src/layers/attention_layer.cc
   src/layers/attention.cc
   src/layers/flash_attention.cc
   src/layers/common.cc
   src/layers/decoder.cc
   src/layers/transformer.cc
-  src/layers/wav2vec2.cc
-  src/layers/wav2vec2bert.cc
   src/layers/whisper.cc
   src/logging.cc
-  src/models/language_model.cc
   src/models/model.cc
   src/models/model_factory.cc
   src/models/model_reader.cc
-  src/models/sequence_to_sequence.cc
-  src/models/transformer.cc
-  src/models/wav2vec2.cc
-  src/models/wav2vec2bert.cc
   src/models/whisper.cc
   src/ops/activation.cc
   src/ops/add.cc
@@ -219,14 +207,11 @@ set(SOURCES
   src/profiler.cc
   src/random.cc
   src/sampling.cc
-  src/scoring.cc
   src/storage_view.cc
   src/thread_pool.cc
-  src/translator.cc
   src/types.cc
   src/utils.cc
   src/vocabulary.cc
-  src/vocabulary_map.cc
 )
 set(CUDA_SOURCES
   src/cuda/allocator.cc
@@ -812,15 +797,7 @@ if (WITH_TENSOR_PARALLEL AND CUDA_DYNAMIC_LOADING)
   target_compile_options(${PROJECT_NAME} PRIVATE -DOMPI_SKIP_MPICXX)
 endif()
 
-if(BUILD_TESTS)
-  add_subdirectory(tests)
-endif()
-
 include(GNUInstallDirs)
-
-if (BUILD_CLI)
-  add_subdirectory(cli)
-endif()
 
 install(
   TARGETS ${PROJECT_NAME} EXPORT ${PROJECT_NAME}Targets
