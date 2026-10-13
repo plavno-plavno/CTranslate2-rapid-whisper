@@ -1,5 +1,7 @@
 #include "module.h"
 
+#include <optional>
+
 #include <ctranslate2/models/whisper.h>
 
 #include "replica_pool.h"
@@ -25,6 +27,181 @@ namespace ctranslate2 {
 
       StorageView encode(const StorageView& features, const bool to_cpu) {
         return _pool->encode(features, to_cpu).get();
+      }
+
+      std::pair<std::shared_ptr<models::WhisperDecoderState>, StorageView>
+      prefill(const StorageView& features, Ids prompt) {
+        std::shared_lock lock(_mutex);
+        assert_model_is_ready();
+        auto result = _pool->prefill(features, std::move(prompt)).get();
+        auto state_ptr = std::make_shared<models::WhisperDecoderState>(
+            std::move(result.first));
+        return {state_ptr, std::move(result.second)};
+      }
+
+      StorageView forward_step(std::shared_ptr<models::WhisperDecoderState> state,
+                               size_t token_id) {
+        std::shared_lock lock(_mutex);
+        assert_model_is_ready();
+        return _pool->forward_step(*state, token_id).get();
+      }
+
+      StorageView forward_batch(std::shared_ptr<models::WhisperDecoderState> state,
+                                Ids token_ids) {
+        std::shared_lock lock(_mutex);
+        assert_model_is_ready();
+        return _pool->forward_batch(*state, std::move(token_ids)).get();
+      }
+
+      size_t forward_step_greedy(std::shared_ptr<models::WhisperDecoderState> state,
+                                 size_t token_id,
+                                 Ids suppress_tokens) {
+        std::shared_lock lock(_mutex);
+        assert_model_is_ready();
+        return _pool->forward_step_greedy(
+            *state, token_id, std::move(suppress_tokens)).get();
+      }
+
+      std::vector<size_t> forward_batch_greedy(
+          std::shared_ptr<models::WhisperDecoderState> state,
+          Ids token_ids,
+          Ids suppress_tokens) {
+        std::shared_lock lock(_mutex);
+        assert_model_is_ready();
+        return _pool->forward_batch_greedy(
+            *state, std::move(token_ids), std::move(suppress_tokens)).get();
+      }
+
+      void set_alignment_heads(const std::vector<std::pair<int64_t, int64_t>>& heads) {
+        std::shared_lock lock(_mutex);
+        assert_model_is_ready();
+        std::vector<std::pair<dim_t, dim_t>> dim_heads;
+        dim_heads.reserve(heads.size());
+        for (const auto& [layer, head] : heads)
+          dim_heads.emplace_back(static_cast<dim_t>(layer), static_cast<dim_t>(head));
+        _pool->set_alignment_heads(std::move(dim_heads));
+      }
+
+      std::tuple<std::shared_ptr<models::WhisperDecoderState>, StorageView, StorageView>
+      prefill_with_attention(const StorageView& features, Ids prompt) {
+        std::shared_lock lock(_mutex);
+        assert_model_is_ready();
+        auto result = _pool->prefill_with_attention(features, std::move(prompt)).get();
+        auto state_ptr = std::make_shared<models::WhisperDecoderState>(
+            std::move(std::get<0>(result)));
+        return {state_ptr, std::move(std::get<1>(result)), std::move(std::get<2>(result))};
+      }
+
+      std::pair<StorageView, StorageView>
+      forward_step_with_attention(std::shared_ptr<models::WhisperDecoderState> state,
+                                  size_t token_id) {
+        std::shared_lock lock(_mutex);
+        assert_model_is_ready();
+        return _pool->forward_step_with_attention(*state, token_id).get();
+      }
+
+      std::pair<size_t, StorageView>
+      forward_step_greedy_with_attention(std::shared_ptr<models::WhisperDecoderState> state,
+                                         size_t token_id) {
+        std::shared_lock lock(_mutex);
+        assert_model_is_ready();
+        return _pool->forward_step_greedy_with_attention(*state, token_id).get();
+      }
+
+      std::pair<StorageView, StorageView>
+      forward_batch_with_attention(std::shared_ptr<models::WhisperDecoderState> state,
+                                   Ids token_ids) {
+        std::shared_lock lock(_mutex);
+        assert_model_is_ready();
+        return _pool->forward_batch_with_attention(*state, std::move(token_ids)).get();
+      }
+
+      StorageView
+      collected_attention_to_cpu(std::shared_ptr<models::WhisperDecoderState> state,
+                                 bool average_heads) {
+        std::shared_lock lock(_mutex);
+        assert_model_is_ready();
+        return _pool->collected_attention_to_cpu(*state, average_heads).get();
+      }
+
+      std::pair<std::shared_ptr<models::WhisperDecoderState>, std::vector<size_t>>
+      generate_greedy_with_attention(const StorageView& features,
+                                     Ids prompt,
+                                     size_t max_new_tokens,
+                                     size_t eot_id,
+                                     std::vector<size_t> suppress_tokens,
+                                     std::vector<size_t> ban_first_tokens) {
+        std::shared_lock lock(_mutex);
+        assert_model_is_ready();
+        auto result = _pool->generate_greedy_with_attention(
+            features,
+            std::move(prompt),
+            max_new_tokens,
+            eot_id,
+            std::move(suppress_tokens),
+            std::move(ban_first_tokens)).get();
+        auto state_ptr = std::make_shared<models::WhisperDecoderState>(
+            std::move(result.first));
+        return {state_ptr, std::move(result.second)};
+      }
+
+      std::pair<std::vector<std::vector<size_t>>, std::vector<StorageView>>
+      generate_dual_greedy(const StorageView& features,
+                           BatchIds prompts,
+                           size_t max_new_tokens,
+                           size_t eot_id,
+                           std::vector<size_t> suppress_tokens,
+                           bool want_attention) {
+        std::shared_lock lock(_mutex);
+        assert_model_is_ready();
+        return _pool->generate_dual_greedy(
+            features,
+            std::move(prompts),
+            max_new_tokens,
+            eot_id,
+            std::move(suppress_tokens),
+            want_attention).get();
+      }
+
+      std::vector<size_t>
+      generate_speculative(WhisperWrapper& draft,
+                           const StorageView& main_features,
+                           const StorageView& draft_features,
+                           Ids prompt,
+                           size_t num_speculative_tokens,
+                           size_t max_length,
+                           size_t eot_id,
+                           Ids suppress_tokens,
+                           std::vector<int32_t> d2m,
+                           std::vector<int32_t> m2d,
+                           size_t min_speculative_tokens,
+                           size_t max_speculative_tokens,
+                           bool reset_adaptive_state) {
+        std::shared_lock lock(_mutex);
+        assert_model_is_ready();
+        // The draft may be the *same* wrapper as the main model (same-model
+        // draft, used in the exactness tests).  Re-locking the same
+        // ``std::shared_mutex`` for shared ownership on one thread is UB,
+        // so only take the draft lock when it is a distinct object.
+        std::optional<std::shared_lock<std::shared_mutex>> draft_lock;
+        if (&draft != this) {
+          draft_lock.emplace(draft._mutex);
+          draft.assert_model_is_ready();
+        }
+        return _pool->generate_speculative(
+            *draft._pool,
+            main_features,
+            draft_features,
+            std::move(prompt),
+            num_speculative_tokens,
+            max_length,
+            eot_id,
+            std::move(suppress_tokens),
+            std::move(d2m),
+            std::move(m2d),
+            min_speculative_tokens,
+            max_speculative_tokens,
+            reset_adaptive_state).get();
       }
 
       std::variant<std::vector<models::WhisperGenerationResult>,
@@ -115,6 +292,66 @@ namespace ctranslate2 {
 
 
     void register_whisper(py::module& m) {
+      py::class_<models::WhisperDecoderState, std::shared_ptr<models::WhisperDecoderState>>(
+        m, "WhisperDecoderState",
+        "Opaque container for Whisper decoder KV-cache state.")
+
+        .def_readonly("current_step", &models::WhisperDecoderState::current_step,
+                      "Number of tokens processed so far (prompt + generated).")
+
+        .def("clone", [](const models::WhisperDecoderState& self) {
+          return std::make_shared<models::WhisperDecoderState>(self.deep_copy());
+        },
+             py::call_guard<py::gil_scoped_release>(),
+             "Return a deep copy of this state (GPU tensors are duplicated).")
+
+        .def("truncate_to_step",
+             [](std::shared_ptr<models::WhisperDecoderState> self, int64_t target_step) {
+               self->truncate_to_step(static_cast<dim_t>(target_step));
+             },
+             py::arg("target_step"),
+             py::call_guard<py::gil_scoped_release>(),
+             R"pbdoc(
+                 Truncate the KV cache to keep only the first ``target_step`` decode steps.
+
+                 Slices self-attention key/value tensors along the time dimension,
+                 trims the collected cross-attention buffer to match, and resets
+                 the internal step counter.  Much cheaper than a full re-prefill
+                 when rolling back after a speculative-decoding rejection or a
+                 hallucination-repair rewind.
+
+                 Arguments:
+                   target_step: Number of decode steps to retain.
+             )pbdoc")
+
+        .def_property_readonly(
+            "collected_attention",
+            [](const models::WhisperDecoderState& self) {
+              return self.collected_attention;
+            },
+            R"pbdoc(
+                Per-step cross-attention rows captured by the ``*_with_attention``
+                APIs.
+
+                Each entry is a :class:`StorageView` of shape
+                ``[1, num_selected_heads, F_enc]`` (post-softmax — each
+                ``(batch, head, :)`` row sums to 1 over encoder frames).  Index
+                ``k`` corresponds to the attention emitted while predicting the
+                ``k``-th newly-generated token (i.e. the row associated with
+                that token's identity).
+
+                The list is empty if attention extraction was never enabled or
+                if it has been truncated all the way back by
+                :meth:`truncate_to_step`.
+            )pbdoc")
+
+        .def("__repr__", [](const models::WhisperDecoderState& s) {
+          return "WhisperDecoderState(current_step=" + std::to_string(s.current_step)
+            + ", num_entries=" + std::to_string(s.state.size())
+            + ", attention_steps=" + std::to_string(s.collected_attention.size()) + ")";
+        })
+        ;
+
       py::class_<models::WhisperGenerationResult>(m, "WhisperGenerationResult",
                                                   "A generation result from the Whisper model.")
 
@@ -339,6 +576,416 @@ namespace ctranslate2 {
 
                  Returns:
                    A list of alignment results.
+             )pbdoc")
+
+        .def("prefill", &WhisperWrapper::prefill,
+             py::arg("features"),
+             py::arg("prompt"),
+             py::call_guard<py::gil_scoped_release>(),
+             R"pbdoc(
+                 Encode features and prefill the decoder with a prompt.
+
+                 Processes the full prompt and returns a decoder state containing the
+                 KV-cache, plus logits for the first generation position.  Use this
+                 with :meth:`forward_step` and :meth:`forward_batch` for incremental
+                 decoding with KV-cache persistence.
+
+                 Arguments:
+                   features: Mel spectrogram with shape ``[1, n_mels, chunk_length]``
+                     or pre-encoded features from :meth:`encode`.
+                   prompt: Token IDs for the full decoder prompt.
+
+                 Returns:
+                   A tuple ``(state, logits)`` where ``state`` is a
+                   :class:`WhisperDecoderState` and ``logits`` has shape
+                   ``[1, vocab_size]``.
+             )pbdoc")
+
+        .def("forward_step", &WhisperWrapper::forward_step,
+             py::arg("state"),
+             py::arg("token_id"),
+             py::call_guard<py::gil_scoped_release>(),
+             R"pbdoc(
+                 Run one decoder step with KV-cache reuse.
+
+                 Arguments:
+                   state: A :class:`WhisperDecoderState` (mutated in-place).
+                   token_id: The token ID to feed at the current step.
+
+                 Returns:
+                   Logits with shape ``[1, vocab_size]``.
+             )pbdoc")
+
+        .def("forward_batch", &WhisperWrapper::forward_batch,
+             py::arg("state"),
+             py::arg("token_ids"),
+             py::call_guard<py::gil_scoped_release>(),
+             R"pbdoc(
+                 Process multiple tokens in parallel with KV-cache reuse.
+
+                 Extends the KV-cache with all provided tokens and returns
+                 logits at every position.  Useful for speculative decoding
+                 verification where the main model checks K draft tokens
+                 in a single forward pass.
+
+                 Arguments:
+                   state: A :class:`WhisperDecoderState` (mutated in-place).
+                   token_ids: List of token IDs to process.
+
+                 Returns:
+                   Logits with shape ``[1, num_tokens, vocab_size]``.
+             )pbdoc")
+
+        .def("forward_step_greedy", &WhisperWrapper::forward_step_greedy,
+             py::arg("state"),
+             py::arg("token_id"),
+             py::arg("suppress_tokens") = std::vector<size_t>(),
+             py::call_guard<py::gil_scoped_release>(),
+             R"pbdoc(
+                 Run one decoder step and return the greedy (argmax) token ID.
+
+                 Like :meth:`forward_step` but performs TopK(1) on the GPU and
+                 returns a single integer instead of the full logits tensor.
+                 Avoids the large GPU-to-CPU transfer of the vocabulary logits.
+
+                 Arguments:
+                   state: A :class:`WhisperDecoderState` (mutated in-place).
+                   token_id: The token ID to feed at the current step.
+                   suppress_tokens: Optional list of token IDs to mask to
+                     -inf on the device before the argmax.  Lets token
+                     suppression stay on the fast greedy path (no full-vocab
+                     logits transfer).  Empty means no suppression.
+
+                 Returns:
+                   The greedy next-token ID.
+             )pbdoc")
+
+        .def("forward_batch_greedy", &WhisperWrapper::forward_batch_greedy,
+             py::arg("state"),
+             py::arg("token_ids"),
+             py::arg("suppress_tokens") = std::vector<size_t>(),
+             py::call_guard<py::gil_scoped_release>(),
+             R"pbdoc(
+                 Process multiple tokens and return greedy predictions at each position.
+
+                 Like :meth:`forward_batch` but performs TopK(1) on the GPU and
+                 returns a list of token IDs instead of the full logits tensor.
+
+                 Arguments:
+                   state: A :class:`WhisperDecoderState` (mutated in-place).
+                   token_ids: List of token IDs to process.
+                   suppress_tokens: Optional list of token IDs to mask to
+                     -inf at every position on the device before the
+                     per-position argmax.  Empty means no suppression.
+
+                 Returns:
+                   List of greedy next-token IDs (one per input position).
+             )pbdoc")
+
+        .def("set_alignment_heads", &WhisperWrapper::set_alignment_heads,
+             py::arg("heads"),
+             py::call_guard<py::gil_scoped_release>(),
+             R"pbdoc(
+                 Configure which cross-attention heads to collect when the
+                 ``*_with_attention`` APIs are used.
+
+                 The same heads are applied to whichever pool replica handles
+                 each request, so this works with multi-replica pools.  Pass an
+                 empty list to disable collection.
+
+                 Enabling a non-empty selection also switches the decoder to
+                 emit **post-softmax** cross-attention (rows that sum to 1 over
+                 encoder frames), which is what timing extractors like
+                 ``viterbi_align_words_with_blanks`` expect.
+
+                 Arguments:
+                   heads: List of ``(layer_index, head_index)`` pairs.
+             )pbdoc")
+
+        .def("prefill_with_attention", &WhisperWrapper::prefill_with_attention,
+             py::arg("features"),
+             py::arg("prompt"),
+             py::call_guard<py::gil_scoped_release>(),
+             R"pbdoc(
+                 Like :meth:`prefill`, but also returns the cross-attention row
+                 for the first generation position and appends it to
+                 ``state.collected_attention``.
+
+                 Arguments:
+                   features: Mel spectrogram with shape ``[1, n_mels, chunk_length]``
+                     or pre-encoded features from :meth:`encode`.
+                   prompt: Token IDs for the full decoder prompt.
+
+                 Returns:
+                   A tuple ``(state, logits, attention)`` where ``attention`` has
+                   shape ``[1, num_selected_heads, F_enc]``.
+             )pbdoc")
+
+        .def("forward_step_with_attention", &WhisperWrapper::forward_step_with_attention,
+             py::arg("state"),
+             py::arg("token_id"),
+             py::call_guard<py::gil_scoped_release>(),
+             R"pbdoc(
+                 Like :meth:`forward_step`, but also returns the cross-attention
+                 row for this step and appends it to ``state.collected_attention``.
+
+                 Arguments:
+                   state: A :class:`WhisperDecoderState` (mutated in-place).
+                   token_id: The token ID to feed at the current step.
+
+                 Returns:
+                   A tuple ``(logits, attention)`` with shapes
+                   ``[1, vocab_size]`` and ``[1, num_selected_heads, F_enc]``.
+             )pbdoc")
+
+        .def("forward_step_greedy_with_attention",
+             &WhisperWrapper::forward_step_greedy_with_attention,
+             py::arg("state"),
+             py::arg("token_id"),
+             py::call_guard<py::gil_scoped_release>(),
+             R"pbdoc(
+                 Like :meth:`forward_step_greedy`, but also returns the
+                 cross-attention row for this step and appends it to
+                 ``state.collected_attention``.
+
+                 Argmax stays on the GPU; only the attention row and the picked
+                 token id leave the device.
+
+                 Arguments:
+                   state: A :class:`WhisperDecoderState` (mutated in-place).
+                   token_id: The token ID to feed at the current step.
+
+                 Returns:
+                   A tuple ``(picked_token_id, attention)`` where ``attention``
+                   has shape ``[1, num_selected_heads, F_enc]``.
+             )pbdoc")
+
+        .def("forward_batch_with_attention",
+             &WhisperWrapper::forward_batch_with_attention,
+             py::arg("state"),
+             py::arg("token_ids"),
+             py::call_guard<py::gil_scoped_release>(),
+             R"pbdoc(
+                 Like :meth:`forward_batch`, but also returns the per-position
+                 cross-attention over encoder frames for the configured
+                 alignment heads.
+
+                 Used by speculative decoding's word-timing path to recover
+                 main-model attention for the always-verified token and for
+                 verifier-correction tokens in the same batched pass (no extra
+                 forward compute).  Requires :meth:`set_alignment_heads` first.
+
+                 Arguments:
+                   state: A :class:`WhisperDecoderState` (mutated in-place).
+                   token_ids: List of token IDs to process.
+
+                 Returns:
+                   A tuple ``(logits, attention)`` where ``logits`` has shape
+                   ``[1, T, vocab_size]`` and ``attention`` is the
+                   head-averaged, post-softmax cross-attention on CPU with
+                   shape ``[T, F_enc]`` (``attention[i]`` is the row used to
+                   predict the token following ``token_ids[i]``).
+             )pbdoc")
+
+        .def("collected_attention_to_cpu",
+             &WhisperWrapper::collected_attention_to_cpu,
+             py::arg("state"),
+             py::arg("average_heads") = true,
+             py::call_guard<py::gil_scoped_release>(),
+             R"pbdoc(
+                 Bulk-transfer ``state.collected_attention`` to CPU as a
+                 single :class:`StorageView`.
+
+                 Internally concatenates every captured per-step attention
+                 row along the time axis **on the device** (one
+                 ``ops::Concat`` call), optionally averages over the
+                 selected heads, casts to float32, and copies the result
+                 to CPU in a single PCIe transfer.  Much faster than
+                 doing one transfer per step when many tokens were
+                 generated.
+
+                 Arguments:
+                   state: A :class:`WhisperDecoderState` (not mutated).
+                   average_heads: If True (default), mean over the
+                     selected heads and return a ``[T, F_enc]`` tensor.
+                     Otherwise return ``[T, num_heads, F_enc]``.
+
+                 Returns:
+                   A CPU :class:`StorageView`; empty if no attention rows
+                   were captured.
+             )pbdoc")
+
+        .def("generate_greedy_with_attention",
+             &WhisperWrapper::generate_greedy_with_attention,
+             py::arg("features"),
+             py::arg("prompt"),
+             py::kw_only(),
+             py::arg("max_new_tokens"),
+             py::arg("eot_id"),
+             py::arg("suppress_tokens") = std::vector<size_t>{},
+             py::arg("ban_first_tokens") = std::vector<size_t>{},
+             py::call_guard<py::gil_scoped_release>(),
+             R"pbdoc(
+                 Run a full greedy decode segment with per-step cross-attention
+                 capture, **entirely inside one CTranslate2 thread-pool job**.
+
+                 This is the fast path used by CrisperWhisper's word-timing
+                 pipeline.  Doing the whole loop in C++ avoids the
+                 Python-to-C++ dispatch (and GPU-to-CPU logits copy) that the
+                 per-step ``forward_step_greedy_with_attention`` API would incur
+                 once per token.
+
+                 Token suppression and the loop-starting "ban" tokens are
+                 applied on the device before argmax, so logits never leave
+                 the GPU on the hot path.
+
+                 Arguments:
+                   features: Mel spectrogram with shape ``[1, n_mels, chunk_length]``
+                     or pre-encoded features from :meth:`encode`.
+                   prompt: Token IDs for the full decoder prompt.  Decoding
+                     starts with the **last** prompt token; everything before
+                     it is consumed by an internal prefill that does not
+                     contribute to ``collected_attention``.
+                   max_new_tokens: Hard cap on how many tokens to generate
+                     before stopping (regardless of EOT).
+                   eot_id: End-of-text token id.  Decoding stops as soon as
+                     this id is emitted (it is included in the returned
+                     sequence).
+                   suppress_tokens: Token ids to mask out at **every** step.
+                   ban_first_tokens: Token ids to mask out **only at the very
+                     first** generated step.  Used by hallucination-repair to
+                     force the model away from the loop-starting token.
+
+                 Returns:
+                   A tuple ``(state, generated)``.  ``state`` is the new
+                   :class:`WhisperDecoderState` with ``current_step`` and
+                   ``collected_attention`` updated.  ``generated`` is the list
+                   of newly emitted token ids, of length
+                   ``len(state.collected_attention)``; the final element will
+                   equal ``eot_id`` when generation stopped on EOT.
+             )pbdoc")
+
+        .def("generate_dual_greedy",
+             &WhisperWrapper::generate_dual_greedy,
+             py::arg("features"),
+             py::arg("prompts"),
+             py::kw_only(),
+             py::arg("max_new_tokens"),
+             py::arg("eot_id"),
+             py::arg("suppress_tokens") = std::vector<size_t>{},
+             py::arg("want_attention") = false,
+             py::call_guard<py::gil_scoped_release>(),
+             R"pbdoc(
+                 Greedy-decode several prompts that share the **same** audio in
+                 one batched decoder pass (the encoder runs once and each row
+                 decodes independently).  This is the fast path for producing
+                 e.g. verbatim and intended transcripts -- plus their
+                 word-timing cross-attention -- at close to the cost of a
+                 single decode.
+
+                 The prompts may have different lengths (their continuation
+                 contexts differ).  Whisper's absolute positions make padding
+                 incorrect, so shorter prompts are first advanced with their
+                 own real greedy tokens ("catch-up") until every active row has
+                 the same length, after which the rows decode together in
+                 lockstep.  The output is token-for-token identical to decoding
+                 each prompt on its own with
+                 :meth:`generate_greedy_with_attention` (greedy, same
+                 suppression).
+
+                 Arguments:
+                   features: Mel spectrogram ``[1, n_mels, chunk_length]`` (or
+                     pre-encoded features from :meth:`encode`) for the single
+                     shared audio.
+                   prompts: List of decoder prompt token-id sequences, one per
+                     row (e.g. verbatim then intended).
+                   max_new_tokens: Per-row cap on generated tokens.
+                   eot_id: End-of-text token id; a row stops as soon as it
+                     emits this id (which is included in that row's output).
+                   suppress_tokens: Token ids masked to -inf on the device
+                     before every argmax.  Empty means no suppression.
+                   want_attention: If True, also return per-row head-averaged
+                     post-softmax cross-attention; requires
+                     :meth:`set_alignment_heads` first.
+
+                 Returns:
+                   A tuple ``(sequences_ids, attention)``.  ``sequences_ids`` is
+                   a list of token-id lists (one per prompt, in order; each
+                   ends with ``eot_id`` when that row stopped on EOT).
+                   ``attention`` is a list of CPU :class:`StorageView` matrices
+                   of shape ``[len(sequence_ids_row), F_enc]`` (1-to-1 with the
+                   row's ids) when ``want_attention`` is set, otherwise a list
+                   of empty views.
+             )pbdoc")
+
+        .def("generate_speculative",
+             &WhisperWrapper::generate_speculative,
+             py::arg("draft"),
+             py::arg("main_features"),
+             py::arg("draft_features"),
+             py::kw_only(),
+             py::arg("prompt"),
+             py::arg("num_speculative_tokens"),
+             py::arg("max_length"),
+             py::arg("eot_id"),
+             py::arg("suppress_tokens") = std::vector<size_t>{},
+             py::arg("d2m") = std::vector<int32_t>{},
+             py::arg("m2d") = std::vector<int32_t>{},
+             py::arg("min_speculative_tokens") = 0,
+             py::arg("max_speculative_tokens") = 0,
+             py::arg("reset_adaptive_state") = true,
+             py::call_guard<py::gil_scoped_release>(),
+             R"pbdoc(
+                 Run the whole **strict** speculative-decoding loop in C++,
+                 inside a single CTranslate2 thread-pool job.
+
+                 ``self`` is the verifier (main model); ``draft`` is a second
+                 :class:`Whisper` whose first replica proposes
+                 ``num_speculative_tokens`` tokens per round.  Both models run
+                 on the main worker thread (one CUDA stream), and only picked
+                 token ids leave the device -- there is no per-token Python
+                 dispatch, which is the overhead this path removes versus
+                 driving ``forward_step_greedy`` / ``forward_batch_greedy``
+                 from Python.
+
+                 Arguments:
+                   draft: The draft :class:`Whisper` model (may be ``self`` for
+                     a same-model draft).
+                   main_features: Mel spectrogram (or pre-encoded features) for
+                     the main model.
+                   draft_features: Mel spectrogram (or pre-encoded features) for
+                     the draft model (same array as ``main_features`` when both
+                     models use the same number of mel bins).
+                   prompt: Decoder prompt token ids, in **main**-vocab space.
+                   num_speculative_tokens: Tokens drafted per verify round (K).
+                   max_length: Maximum number of tokens to generate.
+                   eot_id: End-of-text token id (main-vocab space).
+                   suppress_tokens: Main-vocab token ids masked on the device
+                     before every main-model argmax.  Empty means none.
+                   d2m: ``draft_id -> main_id`` lookup table (-1 = unmapped);
+                     empty means the identity mapping.
+                   m2d: ``main_id -> draft_id`` lookup table (-1 = unmapped);
+                     empty means the identity mapping.
+                   min_speculative_tokens: Lower bound for adaptive K.
+                   max_speculative_tokens: Upper bound for adaptive K.  When
+                     greater than ``min_speculative_tokens`` the number of
+                     tokens drafted per round self-tunes to recent draft
+                     acceptance with a symmetric +1/-1 controller (bump up on
+                     a fully-accepted round, nudge down on any rejection),
+                     clamped to ``[min_speculative_tokens,
+                     max_speculative_tokens]``.  The controller's K persists
+                     across calls, so over a chunked transcription it
+                     converges to the per-audio equilibrium regardless of the
+                     seed.  Leave at 0 to keep K fixed at
+                     ``num_speculative_tokens``.
+                   reset_adaptive_state: Re-seed the persistent adaptive K
+                     from ``num_speculative_tokens`` (pass True on the first
+                     chunk of a new audio; False to keep converging across
+                     subsequent chunks).  Ignored when K is fixed.
+
+                 Returns:
+                   The accepted token ids in main-vocab space (including a
+                   trailing ``eot_id`` when generation stopped on EOT).
              )pbdoc")
 
         .def("unload_model", &WhisperWrapper::unload_model,

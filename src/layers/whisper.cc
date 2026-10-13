@@ -81,5 +81,19 @@ namespace ctranslate2 {
       _proj(step_outputs, logits);
     }
 
+    void WhisperDecoder::forward_with_logits(const StorageView& ids,
+                                             dim_t step,
+                                             DecoderState& state,
+                                             StorageView& logits,
+                                             StorageView* attention) {
+      decode(ids,
+             /*lengths=*/nullptr,
+             step,
+             state,
+             &logits,
+             attention,
+             /*return_logits=*/true);
+    }
+
   }
 }

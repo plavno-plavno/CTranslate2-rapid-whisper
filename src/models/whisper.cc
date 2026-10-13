@@ -3,6 +3,11 @@
 #include <algorithm>
 
 #include "ctranslate2/decoding.h"
+#include "ctranslate2/decoding_utils.h"
+#include "ctranslate2/ops/concat.h"
+#include "ctranslate2/ops/mean.h"
+#include "ctranslate2/ops/topk.h"
+#include "ctranslate2/ops/slide.h"
 
 #include "dispatch.h"
 #include "dtw.h"
@@ -484,6 +489,10 @@ namespace ctranslate2 {
                                  "of ctranslate2.");
 
       _decoder->set_alignment_heads(alignment_heads->get<std::vector<std::pair<dim_t, dim_t>>>());
+      // ``align()`` expects raw pre-softmax cross-attention scores so it
+      // can median-filter and softmax them itself.  Reset the flag here
+      // in case a previous ``*_with_attention`` call set it to true.
+      _decoder->set_return_normalized_attention(false);
 
       std::vector<std::vector<size_t>> input_tokens;
       std::vector<std::vector<size_t>> output_tokens;
@@ -774,6 +783,1271 @@ namespace ctranslate2 {
                                median_filter_width);
         },
         batch_size);
+    }
+
+
+    std::pair<WhisperDecoderState, StorageView>
+    WhisperReplica::prefill(StorageView features,
+                            const std::vector<size_t>& prompt) {
+      PROFILE("WhisperReplica::prefill");
+
+#ifdef CT2_WITH_CUDA
+      const cuda::UseTrueFp16GemmInScope use_true_fp16_gemm(false);
+#endif
+
+      const auto scoped_device_setter = _model->get_scoped_device_setter();
+      const Device device = _decoder->device();
+
+      layers::DecoderState state = _decoder->initial_state();
+      state.emplace("memory", maybe_encode(std::move(features)));
+      _decoder->update_output_layer(_model->preferred_size_multiple());
+
+      if (prompt.size() > 1) {
+        std::vector<std::vector<size_t>> prompt_batch = {
+          std::vector<size_t>(prompt.begin(), prompt.end() - 1)
+        };
+        const StorageView inputs = layers::make_sequence_inputs(prompt_batch, device);
+        _decoder->forward_prompt(inputs, state);
+      }
+
+      const dim_t start_step = prompt.size() > 1
+          ? static_cast<dim_t>(prompt.size()) - 1
+          : 0;
+
+      StorageView last_id({1}, int32_t(prompt.back()), device);
+      StorageView logits(_decoder->output_type(), device);
+      (*_decoder)(start_step, last_id, state, &logits);
+
+      WhisperDecoderState wds;
+      wds.state = std::move(state);
+      wds.current_step = static_cast<dim_t>(prompt.size());
+
+      return {std::move(wds), std::move(logits)};
+    }
+
+    StorageView
+    WhisperReplica::forward_step(WhisperDecoderState& wds,
+                                 size_t token_id) {
+      PROFILE("WhisperReplica::forward_step");
+
+#ifdef CT2_WITH_CUDA
+      const cuda::UseTrueFp16GemmInScope use_true_fp16_gemm(false);
+#endif
+
+      const auto scoped_device_setter = _model->get_scoped_device_setter();
+      const Device device = _decoder->device();
+      _decoder->update_output_layer(_model->preferred_size_multiple());
+
+      StorageView ids({1}, int32_t(token_id), device);
+      StorageView logits(_decoder->output_type(), device);
+      (*_decoder)(wds.current_step, ids, wds.state, &logits);
+      wds.current_step++;
+
+      return logits;
+    }
+
+    StorageView
+    WhisperReplica::forward_batch(WhisperDecoderState& wds,
+                                  const std::vector<size_t>& token_ids) {
+      PROFILE("WhisperReplica::forward_batch");
+
+#ifdef CT2_WITH_CUDA
+      const cuda::UseTrueFp16GemmInScope use_true_fp16_gemm(false);
+#endif
+
+      const auto scoped_device_setter = _model->get_scoped_device_setter();
+      const Device device = _decoder->device();
+      _decoder->update_output_layer(_model->preferred_size_multiple());
+
+      std::vector<std::vector<size_t>> batch = {token_ids};
+      const StorageView ids = layers::make_sequence_inputs(batch, device);
+
+      StorageView logits(_decoder->output_type(), device);
+      _decoder->forward_with_logits(ids, wds.current_step, wds.state, logits);
+      wds.current_step += static_cast<dim_t>(token_ids.size());
+
+      return logits;
+    }
+
+    void
+    WhisperDecoderState::truncate_to_step(dim_t target_step) {
+      if (target_step >= current_step)
+        return;
+      const dim_t steps_to_drop = current_step - target_step;
+      for (auto& [key, tensor] : state) {
+        if (key.compare(0, 10, "self_keys_") == 0
+            || key.compare(0, 12, "self_values_") == 0) {
+          const dim_t time_dim = 2;
+          const dim_t current_len = tensor.dim(time_dim);
+          const dim_t keep_len = current_len - steps_to_drop;
+          if (keep_len > 0 && keep_len < current_len) {
+            StorageView tmp(tensor.dtype(), tensor.device());
+            ops::Slide(time_dim, 0, keep_len)(tensor, tmp);
+            tensor = std::move(tmp);
+          }
+        }
+      }
+      // Keep the cross-attention buffer aligned with the kept tokens.
+      // collected_attention[k] corresponds to predicting the (start+k)-th
+      // newly-generated token, so we resize from the right.
+      if (!collected_attention.empty()) {
+        const dim_t kept = static_cast<dim_t>(collected_attention.size())
+                           - steps_to_drop;
+        if (kept <= 0)
+          collected_attention.clear();
+        else
+          collected_attention.resize(static_cast<size_t>(kept));
+      }
+      current_step = target_step;
+    }
+
+    size_t
+    WhisperReplica::forward_step_greedy(WhisperDecoderState& wds,
+                                        size_t token_id,
+                                        const std::vector<size_t>& suppress_tokens) {
+      PROFILE("WhisperReplica::forward_step_greedy");
+
+#ifdef CT2_WITH_CUDA
+      const cuda::UseTrueFp16GemmInScope use_true_fp16_gemm(false);
+#endif
+
+      const auto scoped_device_setter = _model->get_scoped_device_setter();
+      const Device device = _decoder->device();
+      _decoder->update_output_layer(_model->preferred_size_multiple());
+
+      StorageView ids({1}, int32_t(token_id), device);
+      StorageView logits(_decoder->output_type(), device);
+      (*_decoder)(wds.current_step, ids, wds.state, &logits);
+      wds.current_step++;
+
+      // Mask suppressed tokens on the device before argmax so suppression
+      // stays on the fast greedy path (no full-vocab transfer to Python).
+      if (!suppress_tokens.empty()) {
+        DisableTokens disable(logits);
+        for (const size_t tid : suppress_tokens)
+          disable.add(static_cast<dim_t>(tid));
+        disable.apply();
+      }
+
+      StorageView best_ids(DataType::INT32, device);
+      StorageView best_scores(logits.dtype(), device);
+      ops::TopK(1)(logits, best_scores, best_ids);
+
+      StorageView best_ids_cpu(DataType::INT32);
+      best_ids_cpu.copy_from(best_ids);
+      return static_cast<size_t>(best_ids_cpu.scalar_at<int32_t>({0, 0}));
+    }
+
+    std::vector<size_t>
+    WhisperReplica::forward_batch_greedy(WhisperDecoderState& wds,
+                                         const std::vector<size_t>& token_ids,
+                                         const std::vector<size_t>& suppress_tokens) {
+      PROFILE("WhisperReplica::forward_batch_greedy");
+
+#ifdef CT2_WITH_CUDA
+      const cuda::UseTrueFp16GemmInScope use_true_fp16_gemm(false);
+#endif
+
+      const auto scoped_device_setter = _model->get_scoped_device_setter();
+      const Device device = _decoder->device();
+      _decoder->update_output_layer(_model->preferred_size_multiple());
+
+      std::vector<std::vector<size_t>> batch = {token_ids};
+      const StorageView ids = layers::make_sequence_inputs(batch, device);
+
+      StorageView logits(_decoder->output_type(), device);
+      _decoder->forward_with_logits(ids, wds.current_step, wds.state, logits);
+      wds.current_step += static_cast<dim_t>(token_ids.size());
+
+      // Mask suppressed tokens at every position on the device before the
+      // per-position argmax.  ``forward_with_logits`` returns logits shaped
+      // ``[1, seq, vocab]``; DisableTokens treats dim(0) as batch and
+      // dim(1) as vocab, so reshape to ``[seq, vocab]`` first.  ``add(tid)``
+      // then disables the token for all positions, matching a
+      // non-speculative suppressed decode.
+      if (!suppress_tokens.empty()) {
+        const dim_t vocab = logits.dim(-1);
+        const Shape saved_shape = logits.shape();
+        logits.reshape({logits.size() / vocab, vocab});
+        DisableTokens disable(logits);
+        for (const size_t tid : suppress_tokens)
+          disable.add(static_cast<dim_t>(tid));
+        disable.apply();
+        logits.reshape(saved_shape);
+      }
+
+      StorageView best_ids(DataType::INT32, device);
+      StorageView best_scores(logits.dtype(), device);
+      ops::TopK(1)(logits, best_scores, best_ids);
+
+      StorageView best_ids_cpu(DataType::INT32);
+      best_ids_cpu.copy_from(best_ids);
+
+      const dim_t n = static_cast<dim_t>(token_ids.size());
+      std::vector<size_t> result(n);
+      for (dim_t i = 0; i < n; ++i)
+        result[i] = static_cast<size_t>(best_ids_cpu.at<int32_t>(i));
+      return result;
+    }
+
+    // -----------------------------------------------------------------------
+    // Cross-attention extraction for word timings (used by CrisperWhisper).
+    //
+    // ``set_alignment_heads`` selects a fixed list of (layer, head) pairs
+    // that the decoder will gather and concatenate into the ``attention``
+    // output of every subsequent decode step.  ``*_with_attention``
+    // variants of ``prefill`` / ``forward_step`` / ``forward_step_greedy``
+    // capture that per-step row into ``state.collected_attention`` so the
+    // caller can do a single bulk GPU->CPU transfer at the end of a
+    // generation run.
+    //
+    // The selected heads are post-softmax cross-attention probabilities
+    // (rows sum to 1 over encoder frames), which is what
+    // CrisperWhisper-style Viterbi/peak-mass timing extractors expect.
+    // -----------------------------------------------------------------------
+
+    void
+    WhisperReplica::set_alignment_heads(
+        const std::vector<std::pair<dim_t, dim_t>>& heads) {
+      _decoder->set_alignment_heads(heads);
+      // Empty list disables collection; in that case keep the decoder in
+      // its default raw-attention mode (used by ``align()``).  Otherwise
+      // request post-softmax rows so timing extractors get probability
+      // distributions over encoder frames.
+      _decoder->set_return_normalized_attention(!heads.empty());
+    }
+
+    static void require_alignment_heads_configured(const layers::WhisperDecoder& dec) {
+      // ``decode()`` only populates the ``attention`` output when at
+      // least one ``(layer, head)`` pair is configured.  Catch the
+      // common mistake of calling ``*_with_attention`` before
+      // ``set_alignment_heads`` and give a useful error message.
+      if (!dec.return_normalized_attention())
+        throw std::runtime_error(
+            "WhisperReplica: no alignment heads configured for "
+            "*_with_attention(); call set_alignment_heads([...]) first.");
+    }
+
+    std::tuple<WhisperDecoderState, StorageView, StorageView>
+    WhisperReplica::prefill_with_attention(StorageView features,
+                                           const std::vector<size_t>& prompt) {
+      PROFILE("WhisperReplica::prefill_with_attention");
+      require_alignment_heads_configured(*_decoder);
+
+#ifdef CT2_WITH_CUDA
+      const cuda::UseTrueFp16GemmInScope use_true_fp16_gemm(false);
+#endif
+
+      const auto scoped_device_setter = _model->get_scoped_device_setter();
+      const Device device = _decoder->device();
+
+      layers::DecoderState state = _decoder->initial_state();
+      state.emplace("memory", maybe_encode(std::move(features)));
+      _decoder->update_output_layer(_model->preferred_size_multiple());
+
+      if (prompt.size() > 1) {
+        std::vector<std::vector<size_t>> prompt_batch = {
+          std::vector<size_t>(prompt.begin(), prompt.end() - 1)
+        };
+        const StorageView inputs = layers::make_sequence_inputs(prompt_batch, device);
+        // We discard the prompt's per-step attention here: those rows
+        // correspond to prompt tokens, not to generated tokens.
+        _decoder->forward_prompt(inputs, state);
+      }
+
+      const dim_t start_step = prompt.size() > 1
+          ? static_cast<dim_t>(prompt.size()) - 1
+          : 0;
+
+      StorageView last_id({1}, int32_t(prompt.back()), device);
+      StorageView logits(_decoder->output_type(), device);
+      StorageView attention(_decoder->output_type(), device);
+      (*_decoder)(start_step, last_id, state, &logits, &attention);
+
+      WhisperDecoderState wds;
+      wds.state = std::move(state);
+      wds.current_step = static_cast<dim_t>(prompt.size());
+      // The attention row at this step corresponds to predicting the
+      // first new (generated) token: append it to the buffer.
+      wds.collected_attention.emplace_back(attention);
+
+      return {std::move(wds), std::move(logits), std::move(attention)};
+    }
+
+    std::pair<StorageView, StorageView>
+    WhisperReplica::forward_step_with_attention(WhisperDecoderState& wds,
+                                                size_t token_id) {
+      PROFILE("WhisperReplica::forward_step_with_attention");
+      require_alignment_heads_configured(*_decoder);
+
+#ifdef CT2_WITH_CUDA
+      const cuda::UseTrueFp16GemmInScope use_true_fp16_gemm(false);
+#endif
+
+      const auto scoped_device_setter = _model->get_scoped_device_setter();
+      const Device device = _decoder->device();
+      _decoder->update_output_layer(_model->preferred_size_multiple());
+
+      StorageView ids({1}, int32_t(token_id), device);
+      StorageView logits(_decoder->output_type(), device);
+      StorageView attention(_decoder->output_type(), device);
+      (*_decoder)(wds.current_step, ids, wds.state, &logits, &attention);
+      wds.current_step++;
+      wds.collected_attention.emplace_back(attention);
+
+      return {std::move(logits), std::move(attention)};
+    }
+
+    std::pair<size_t, StorageView>
+    WhisperReplica::forward_step_greedy_with_attention(WhisperDecoderState& wds,
+                                                       size_t token_id) {
+      PROFILE("WhisperReplica::forward_step_greedy_with_attention");
+      require_alignment_heads_configured(*_decoder);
+
+#ifdef CT2_WITH_CUDA
+      const cuda::UseTrueFp16GemmInScope use_true_fp16_gemm(false);
+#endif
+
+      const auto scoped_device_setter = _model->get_scoped_device_setter();
+      const Device device = _decoder->device();
+      _decoder->update_output_layer(_model->preferred_size_multiple());
+
+      StorageView ids({1}, int32_t(token_id), device);
+      StorageView logits(_decoder->output_type(), device);
+      StorageView attention(_decoder->output_type(), device);
+      (*_decoder)(wds.current_step, ids, wds.state, &logits, &attention);
+      wds.current_step++;
+      wds.collected_attention.emplace_back(attention);
+
+      StorageView best_ids(DataType::INT32, device);
+      StorageView best_scores(logits.dtype(), device);
+      ops::TopK(1)(logits, best_scores, best_ids);
+
+      StorageView best_ids_cpu(DataType::INT32);
+      best_ids_cpu.copy_from(best_ids);
+      const size_t picked = static_cast<size_t>(best_ids_cpu.scalar_at<int32_t>({0, 0}));
+      return {picked, std::move(attention)};
+    }
+
+    std::pair<WhisperDecoderState, std::vector<size_t>>
+    WhisperReplica::generate_greedy_with_attention(
+        StorageView features,
+        const std::vector<size_t>& prompt,
+        size_t max_new_tokens,
+        size_t eot_id,
+        const std::vector<size_t>& suppress_tokens,
+        const std::vector<size_t>& ban_first_tokens) {
+      PROFILE("WhisperReplica::generate_greedy_with_attention");
+      require_alignment_heads_configured(*_decoder);
+
+      if (prompt.empty())
+        throw std::invalid_argument(
+            "generate_greedy_with_attention: prompt must be non-empty");
+
+#ifdef CT2_WITH_CUDA
+      const cuda::UseTrueFp16GemmInScope use_true_fp16_gemm(false);
+#endif
+
+      const auto scoped_device_setter = _model->get_scoped_device_setter();
+      const Device device = _decoder->device();
+
+      layers::DecoderState state = _decoder->initial_state();
+      state.emplace("memory", maybe_encode(std::move(features)));
+      _decoder->update_output_layer(_model->preferred_size_multiple());
+
+      // Prefill all but the last prompt token; the last one drives the
+      // first generation step (where we want attention + logits).
+      if (prompt.size() > 1) {
+        std::vector<std::vector<size_t>> prompt_batch = {
+          std::vector<size_t>(prompt.begin(), prompt.end() - 1)
+        };
+        const StorageView inputs = layers::make_sequence_inputs(prompt_batch, device);
+        _decoder->forward_prompt(inputs, state);
+      }
+
+      WhisperDecoderState wds;
+      wds.state = std::move(state);
+      wds.current_step = prompt.size() > 1
+          ? static_cast<dim_t>(prompt.size()) - 1
+          : 0;
+      wds.collected_attention.reserve(max_new_tokens);
+
+      std::vector<size_t> generated;
+      generated.reserve(max_new_tokens);
+
+      size_t cur_token = prompt.back();
+
+      for (size_t step = 0; step < max_new_tokens; ++step) {
+        StorageView ids({1}, int32_t(cur_token), device);
+        StorageView logits(_decoder->output_type(), device);
+        StorageView attention(_decoder->output_type(), device);
+        (*_decoder)(wds.current_step, ids, wds.state, &logits, &attention);
+        wds.current_step++;
+        wds.collected_attention.emplace_back(std::move(attention));
+
+        // Mask suppressed tokens (and the loop-starting "ban" tokens on
+        // step 0 only) directly on the device before argmax.
+        {
+          DisableTokens disable(logits);
+          for (const size_t tid : suppress_tokens)
+            disable.add(static_cast<dim_t>(tid));
+          if (step == 0) {
+            for (const size_t tid : ban_first_tokens)
+              disable.add(static_cast<dim_t>(tid));
+          }
+          disable.apply();
+        }
+
+        StorageView best_ids(DataType::INT32, device);
+        StorageView best_scores(logits.dtype(), device);
+        ops::TopK(1)(logits, best_scores, best_ids);
+
+        StorageView best_ids_cpu(DataType::INT32);
+        best_ids_cpu.copy_from(best_ids);
+        const size_t picked = static_cast<size_t>(
+            best_ids_cpu.scalar_at<int32_t>({0, 0}));
+
+        generated.push_back(picked);
+        if (picked == eot_id)
+          break;
+        cur_token = picked;
+      }
+
+      return {std::move(wds), std::move(generated)};
+    }
+
+    // --- Helpers for generate_speculative -------------------------------
+
+    namespace {
+      // ``table[id]`` with empty-table == identity and out-of-range == -1.
+      inline int32_t map_token(const std::vector<int32_t>& table, size_t id) {
+        if (table.empty())
+          return static_cast<int32_t>(id);
+        if (id < table.size())
+          return table[id];
+        return -1;
+      }
+
+      // On-device argmax over a ``[1, vocab]`` (or ``[.., vocab]``) logits
+      // tensor with optional token suppression, mirroring
+      // ``forward_step_greedy``'s tail so the prefill / verify argmaxes
+      // stay on the GPU.
+      inline size_t argmax_suppressed_device(StorageView& logits,
+                                             const std::vector<size_t>& suppress_tokens) {
+        const Device device = logits.device();
+        if (!suppress_tokens.empty()) {
+          DisableTokens disable(logits);
+          for (const size_t tid : suppress_tokens)
+            disable.add(static_cast<dim_t>(tid));
+          disable.apply();
+        }
+        StorageView best_ids(DataType::INT32, device);
+        StorageView best_scores(logits.dtype(), device);
+        ops::TopK(1)(logits, best_scores, best_ids);
+        StorageView best_ids_cpu(DataType::INT32);
+        best_ids_cpu.copy_from(best_ids);
+        return static_cast<size_t>(best_ids_cpu.scalar_at<int32_t>({0, 0}));
+      }
+    }
+
+    std::pair<std::vector<std::vector<size_t>>, std::vector<StorageView>>
+    WhisperReplica::generate_dual_greedy(
+        StorageView features,
+        const std::vector<std::vector<size_t>>& prompts,
+        size_t max_new_tokens,
+        size_t eot_id,
+        const std::vector<size_t>& suppress_tokens,
+        bool want_attention) {
+      PROFILE("WhisperReplica::generate_dual_greedy");
+      if (want_attention)
+        require_alignment_heads_configured(*_decoder);
+
+      const size_t n_rows = prompts.size();
+      if (n_rows == 0)
+        return {};
+      for (const auto& p : prompts)
+        if (p.empty())
+          throw std::invalid_argument(
+              "generate_dual_greedy: every prompt must be non-empty");
+
+#ifdef CT2_WITH_CUDA
+      const cuda::UseTrueFp16GemmInScope use_true_fp16_gemm(false);
+#endif
+
+      const auto scoped_device_setter = _model->get_scoped_device_setter();
+      const Device device = _decoder->device();
+      const DataType dtype = _decoder->output_type();
+      _decoder->update_output_layer(_model->preferred_size_multiple());
+
+      // Encode the shared audio once; reused for every row.
+      StorageView memory = maybe_encode(std::move(features));  // [1, F, dim]
+
+      // Head-average a single-position attention tensor ``[rows, heads, F]``
+      // to a CPU float32 ``[rows, F]``.
+      auto attn_to_cpu_rows = [&](const StorageView& attention) -> StorageView {
+        StorageView reduced(attention.dtype(), device);
+        ops::Mean(1)(attention, reduced);              // [rows, 1, F]
+        StorageView fp32 = reduced.to(DataType::FLOAT32);
+        StorageView cpu = fp32.to(Device::CPU);        // [rows, 1, F]
+        if (cpu.rank() == 3 && cpu.dim(1) == 1)
+          cpu.squeeze(1);                              // [rows, F]
+        return cpu;
+      };
+
+      // Per-row results (indexed by original prompt order).
+      std::vector<std::vector<size_t>> gen_ids(n_rows);
+      std::vector<std::vector<float>> attn_flat(n_rows);
+      std::vector<bool> finished(n_rows, false);
+      dim_t F_enc = 0;
+
+      size_t target_len = 0;
+      for (const auto& p : prompts)
+        target_len = std::max(target_len, p.size());
+      const dim_t target_step = static_cast<dim_t>(target_len) - 1;
+
+      // Catch-up: decode every row on its own -- exactly as a single-mode
+      // decode would (prompt prefill + incremental greedy steps) -- until its
+      // KV cache reaches ``target_step`` positions.  Rows already at
+      // ``target_len`` need zero extra steps.  Keeping each row's
+      // incrementally-built KV (rather than re-prefilling an extended prompt)
+      // is what makes the batched result bit-identical to a per-mode decode:
+      // the catch-up tokens' cache is produced by the same forward_step path
+      // the reference uses, so no forward_prompt-vs-incremental drift creeps
+      // in.  A row that emits EOT during catch-up is finished and excluded.
+      std::vector<size_t> active;                          // original indices
+      std::vector<layers::DecoderState> states;           // per active row
+      std::vector<size_t> next_feed;                       // token at target_step
+
+      for (size_t i = 0; i < n_rows; ++i) {
+        const auto& prompt = prompts[i];
+
+        layers::DecoderState state = _decoder->initial_state();
+        state.emplace("memory", StorageView(memory));      // own copy of memory
+        dim_t cur_step = 0;
+        if (prompt.size() > 1) {
+          std::vector<std::vector<size_t>> pb = {
+            std::vector<size_t>(prompt.begin(), prompt.end() - 1)
+          };
+          const StorageView inputs = layers::make_sequence_inputs(pb, device);
+          _decoder->forward_prompt(inputs, state);
+          cur_step = static_cast<dim_t>(prompt.size()) - 1;
+        }
+
+        size_t cur_token = prompt.back();
+        bool hit_eot = false;
+        while (cur_step < target_step) {
+          StorageView ids({1}, int32_t(cur_token), device);
+          StorageView logits(dtype, device);
+          StorageView attention(dtype, device);
+          (*_decoder)(cur_step, ids, state, &logits,
+                      want_attention ? &attention : nullptr);
+          cur_step++;
+          const size_t picked = argmax_suppressed_device(logits, suppress_tokens);
+          gen_ids[i].push_back(picked);
+          if (want_attention) {
+            StorageView row_cpu = attn_to_cpu_rows(attention);  // [1, F]
+            if (F_enc == 0)
+              F_enc = row_cpu.dim(-1);
+            const float* ptr = row_cpu.data<float>();
+            attn_flat[i].insert(attn_flat[i].end(), ptr, ptr + row_cpu.dim(-1));
+          }
+          if (picked == eot_id) { hit_eot = true; break; }
+          cur_token = picked;
+        }
+
+        if (hit_eot) {
+          finished[i] = true;            // fully decoded within catch-up
+        } else {
+          active.push_back(i);
+          states.push_back(std::move(state));
+          next_feed.push_back(cur_token);
+        }
+      }
+
+      const size_t A = active.size();
+      if (A > 0) {
+        // Fuse the per-row caches into one batched decoder state by
+        // concatenating every cache tensor along the batch axis.  All rows
+        // are at ``target_step`` positions, the audio (memory) is shared, so
+        // each key has matching shape across rows.
+        layers::DecoderState bstate;
+        {
+          const ops::Concat concat_op(0);
+          for (const auto& kv : states[0]) {
+            const std::string& key = kv.first;
+            std::vector<const StorageView*> ins;
+            ins.reserve(A);
+            for (auto& st : states)
+              ins.push_back(&st.at(key));
+            StorageView out(kv.second.dtype(), device);
+            if (A == 1)
+              out = *ins[0];
+            else
+              concat_op(ins, out);
+            bstate.emplace(key, std::move(out));
+          }
+        }
+
+        dim_t cur_step = target_step;
+
+        std::vector<size_t> cur(A);
+        std::vector<bool> bfin(A, false);
+        for (size_t a = 0; a < A; ++a)
+          cur[a] = next_feed[a];
+
+        for (size_t t = 0; t < max_new_tokens; ++t) {
+          bool any_active = false;
+          for (size_t a = 0; a < A; ++a)
+            if (!bfin[a]) { any_active = true; break; }
+          if (!any_active)
+            break;
+
+          std::vector<int32_t> cur_i32(A);
+          for (size_t a = 0; a < A; ++a)
+            cur_i32[a] = static_cast<int32_t>(cur[a]);
+          StorageView ids_cpu({static_cast<dim_t>(A)}, cur_i32);
+          StorageView ids = ids_cpu.to(device);
+
+          StorageView logits(dtype, device);
+          StorageView attention(dtype, device);
+          (*_decoder)(cur_step, ids, bstate, &logits,
+                      want_attention ? &attention : nullptr);
+          cur_step++;
+
+          if (!suppress_tokens.empty()) {
+            DisableTokens disable(logits);
+            for (const size_t tid : suppress_tokens)
+              disable.add(static_cast<dim_t>(tid));
+            disable.apply();
+          }
+
+          StorageView best_ids(DataType::INT32, device);
+          StorageView best_scores(logits.dtype(), device);
+          ops::TopK(1)(logits, best_scores, best_ids);          // [A, 1]
+          StorageView best_cpu(DataType::INT32);
+          best_cpu.copy_from(best_ids);
+
+          StorageView attn_cpu;                                 // [A, F]
+          if (want_attention) {
+            attn_cpu = attn_to_cpu_rows(attention);
+            if (F_enc == 0)
+              F_enc = attn_cpu.dim(-1);
+          }
+
+          for (size_t a = 0; a < A; ++a) {
+            if (bfin[a])
+              continue;
+            const size_t i = active[a];
+            const size_t picked = static_cast<size_t>(best_cpu.at<int32_t>(a));
+            gen_ids[i].push_back(picked);
+            if (want_attention) {
+              const float* row = attn_cpu.index<float>({static_cast<dim_t>(a), 0});
+              attn_flat[i].insert(attn_flat[i].end(), row, row + F_enc);
+            }
+            if (picked == eot_id) {
+              bfin[a] = true;
+            } else {
+              cur[a] = picked;
+              if (gen_ids[i].size() >= max_new_tokens)
+                bfin[a] = true;
+            }
+          }
+        }
+      }
+
+      // Assemble per-row attention matrices (or empty views).
+      std::vector<StorageView> attn_out(n_rows);
+      if (want_attention) {
+        for (size_t i = 0; i < n_rows; ++i) {
+          const dim_t n = static_cast<dim_t>(gen_ids[i].size());
+          if (n == 0 || F_enc == 0)
+            continue;
+          attn_out[i] = StorageView({n, F_enc}, attn_flat[i]);
+        }
+      }
+
+      return {std::move(gen_ids), std::move(attn_out)};
+    }
+
+    std::vector<size_t>
+    WhisperReplica::generate_speculative(
+        WhisperReplica& draft,
+        StorageView main_features,
+        StorageView draft_features,
+        const std::vector<size_t>& prompt,
+        size_t num_speculative_tokens,
+        size_t max_length,
+        size_t eot_id,
+        const std::vector<size_t>& suppress_tokens,
+        const std::vector<int32_t>& d2m,
+        const std::vector<int32_t>& m2d,
+        size_t min_speculative_tokens,
+        size_t max_speculative_tokens,
+        bool reset_adaptive_state) {
+      PROFILE("WhisperReplica::generate_speculative");
+
+#ifdef CT2_WITH_CUDA
+      const cuda::UseTrueFp16GemmInScope use_true_fp16_gemm(false);
+#endif
+
+      // Adaptive-K controller: symmetric +1/-1 with *persistent* state.  A
+      // round where every drafted token is accepted bumps K up by two; any
+      // rejection nudges it down by one (AIMD, as in HF assisted decoding).
+      // The equilibrium is therefore the K at which ~1/3 of the rounds fully
+      // accept -- a purely acceptance-driven operating point that needs no
+      // hand-tuned window.  The up-bias keeps K near the cap when acceptance
+      // is high (the wall-time optimum for large-v2+turbo) while still backing
+      // off on genuinely low-acceptance audio.  Because K persists
+      // across calls (``_spec_k_state``), over a chunked transcription it
+      // converges to that equilibrium regardless of the seed, so the seed
+      // only matters for the very first chunk (see research/timing
+      // experiment_adaptive_k.py).  Disabled (fixed K) unless a usable
+      // [min, max] window is supplied.
+      const bool adaptive =
+          max_speculative_tokens > 0
+          && max_speculative_tokens > min_speculative_tokens;
+      const size_t k_lo = std::max<size_t>(1, min_speculative_tokens);
+      const size_t k_hi = std::max(k_lo, max_speculative_tokens);
+      constexpr double K_STEP_UP = 2.0;    // climb on a fully-accepted round
+      constexpr double K_STEP_DOWN = 1.0;  // nudge on any rejection
+      double k_cur = static_cast<double>(num_speculative_tokens);
+      if (adaptive) {
+        // Persist across chunks: continue from the stored state unless the
+        // caller asked to reset (first chunk of a new audio) or it is still
+        // uninitialised.
+        if (!reset_adaptive_state && _spec_k_state > 0.0)
+          k_cur = _spec_k_state;
+        k_cur = std::min(std::max(k_cur, static_cast<double>(k_lo)),
+                         static_cast<double>(k_hi));
+      }
+      const size_t K = num_speculative_tokens;
+
+      // Encode both models once and reuse the encoder output for every
+      // (re-)prefill (matches the Python ``_encode_both`` + reuse).  A
+      // fresh copy is handed to each ``prefill`` because it takes the
+      // features by value; ``maybe_encode`` detects already-encoded
+      // input and passes it straight through.
+      const StorageView main_enc = maybe_encode(std::move(main_features));
+      const StorageView draft_enc = draft.maybe_encode(std::move(draft_features));
+
+      auto to_draft = [&](size_t main_id) -> int32_t {
+        return map_token(m2d, main_id);
+      };
+      auto to_main = [&](size_t draft_id) -> int32_t {
+        return map_token(d2m, draft_id);
+      };
+      auto prompt_to_draft = [&](const std::vector<size_t>& main_prompt) {
+        std::vector<size_t> out;
+        out.reserve(main_prompt.size());
+        for (const size_t t : main_prompt) {
+          const int32_t d = to_draft(t);
+          out.push_back(d == -1 ? t : static_cast<size_t>(d));
+        }
+        return out;
+      };
+
+      const int32_t draft_eot_i = to_draft(eot_id);
+      const size_t draft_eot =
+          draft_eot_i == -1 ? eot_id : static_cast<size_t>(draft_eot_i);
+
+      // Prefill both decoders from a main-space prompt and return the
+      // main model's (suppressed) first-token argmax.
+      auto prefill_both = [&](const std::vector<size_t>& main_prompt,
+                              WhisperDecoderState& main_state,
+                              WhisperDecoderState& draft_state) -> size_t {
+        const std::vector<size_t> draft_prompt = prompt_to_draft(main_prompt);
+        auto mres = prefill(StorageView(main_enc), main_prompt);
+        main_state = std::move(mres.first);
+        StorageView main_logits = std::move(mres.second);
+        auto dres = draft.prefill(StorageView(draft_enc), draft_prompt);
+        draft_state = std::move(dres.first);
+        return argmax_suppressed_device(main_logits, suppress_tokens);
+      };
+
+      WhisperDecoderState main_state;
+      WhisperDecoderState draft_state;
+      size_t main_next = prefill_both(prompt, main_state, draft_state);
+
+      std::vector<size_t> accepted;
+      const std::vector<size_t>& full_prompt = prompt;
+
+      auto reprefill_full = [&]() {
+        std::vector<size_t> fp(full_prompt);
+        fp.insert(fp.end(), accepted.begin(), accepted.end());
+        main_next = prefill_both(fp, main_state, draft_state);
+      };
+
+      while (accepted.size() < max_length) {
+        if (main_next == eot_id) {
+          accepted.push_back(main_next);
+          break;
+        }
+
+        const size_t budget = max_length - accepted.size();
+        if (budget <= 1) {  // draft_n = min(K, budget - 1) <= 0
+          accepted.push_back(main_next);
+          break;
+        }
+        size_t K_round = K;
+        if (adaptive) {
+          K_round = static_cast<size_t>(k_cur + 0.5);
+          if (K_round < k_lo)
+            K_round = k_lo;
+          if (K_round > k_hi)
+            K_round = k_hi;
+        }
+        const size_t draft_n = std::min(K_round, budget - 1);
+
+        // --- Draft phase (greedy, no suppression on the draft model) ---
+        std::vector<size_t> candidates_main;
+        std::vector<size_t> candidates_draft;
+        const int32_t seed_draft = to_draft(main_next);
+
+        if (seed_draft == -1) {
+          accepted.push_back(main_next);
+          reprefill_full();
+          continue;
+        }
+
+        size_t draft_tok = static_cast<size_t>(seed_draft);
+        for (size_t i = 0; i < draft_n; ++i) {
+          draft_tok = draft.forward_step_greedy(draft_state, draft_tok, {});
+          const int32_t main_tok = to_main(draft_tok);
+          if (main_tok == -1)
+            break;
+          candidates_draft.push_back(draft_tok);
+          candidates_main.push_back(static_cast<size_t>(main_tok));
+          if (draft_tok == draft_eot)
+            break;
+        }
+
+        if (candidates_main.empty()) {
+          accepted.push_back(main_next);
+          reprefill_full();
+          continue;
+        }
+
+        // --- Verify phase (single batched main pass) ---
+        const dim_t main_step_before_verify = main_state.current_step;
+        std::vector<size_t> batch_tokens;
+        batch_tokens.reserve(candidates_main.size() + 1);
+        batch_tokens.push_back(main_next);
+        batch_tokens.insert(batch_tokens.end(),
+                            candidates_main.begin(), candidates_main.end());
+
+        const std::vector<size_t> verify_preds =
+            forward_batch_greedy(main_state, batch_tokens, suppress_tokens);
+
+        // --- Strict acceptance ---
+        size_t n_draft_accepted = 0;
+        bool has_correction = false;
+        size_t correction = 0;
+        for (size_t j = 0; j < candidates_main.size(); ++j) {
+          if (j >= verify_preds.size())
+            break;
+          if (verify_preds[j] == candidates_main[j]) {
+            ++n_draft_accepted;
+            if (candidates_main[j] == eot_id)
+              break;
+          } else {
+            correction = verify_preds[j];
+            has_correction = true;
+            break;
+          }
+        }
+
+        accepted.push_back(main_next);
+        for (size_t j = 0; j < n_draft_accepted; ++j)
+          accepted.push_back(candidates_main[j]);
+        if (has_correction)
+          accepted.push_back(correction);
+
+        if (!accepted.empty() && accepted.back() == eot_id)
+          break;
+
+        // --- State management ---
+        const bool all_accepted =
+            (n_draft_accepted == candidates_main.size()) && !has_correction;
+
+        // Adapt K for the next round: AIMD +2 on a fully-accepted round, -1 on
+        // any rejection (converges to the ~1/3-full-accept equilibrium, biased
+        // toward the cap when acceptance is high).
+        if (adaptive) {
+          if (all_accepted)
+            k_cur = std::min(static_cast<double>(k_hi), k_cur + K_STEP_UP);
+          else
+            k_cur = std::max(static_cast<double>(k_lo), k_cur - K_STEP_DOWN);
+        }
+
+        if (all_accepted) {
+          if (!candidates_draft.empty())
+            draft.forward_step_greedy(draft_state, candidates_draft.back(), {});
+          const size_t last_idx = candidates_main.size();
+          if (last_idx < verify_preds.size()) {
+            main_next = verify_preds[last_idx];
+          } else {
+            reprefill_full();
+          }
+        } else {
+          const dim_t rollback_to =
+              main_step_before_verify + 1 + static_cast<dim_t>(n_draft_accepted);
+          main_state.truncate_to_step(rollback_to);
+          main_next = forward_step_greedy(main_state, accepted.back(),
+                                          suppress_tokens);
+          std::vector<size_t> fp(full_prompt);
+          fp.insert(fp.end(), accepted.begin(), accepted.end());
+          auto dres = draft.prefill(StorageView(draft_enc), prompt_to_draft(fp));
+          draft_state = std::move(dres.first);
+        }
+      }
+
+      // Persist the converged K for the next chunk of this audio.
+      if (adaptive)
+        _spec_k_state = k_cur;
+
+      return accepted;
+    }
+
+    StorageView
+    WhisperReplica::collected_attention_to_cpu(const WhisperDecoderState& state,
+                                               bool average_heads) const {
+      PROFILE("WhisperReplica::collected_attention_to_cpu");
+      const auto& rows = state.collected_attention;
+      if (rows.empty())
+        return StorageView();
+
+#ifdef CT2_WITH_CUDA
+      const cuda::UseTrueFp16GemmInScope use_true_fp16_gemm(false);
+#endif
+
+      const auto scoped_device_setter = _model->get_scoped_device_setter();
+      const Device device = _decoder->device();
+      const DataType dtype = rows.front().dtype();
+
+      // ``Concat`` requires pointers to all inputs.  Each row has shape
+      // ``[1, num_heads, F_enc]``, so concatenating along axis 0 yields
+      // ``[T, num_heads, F_enc]`` -- the natural per-step stacking.
+      std::vector<const StorageView*> ptrs;
+      ptrs.reserve(rows.size());
+      for (const auto& row : rows)
+        ptrs.push_back(&row);
+
+      StorageView stacked(dtype, device);
+      ops::Concat(/*axis=*/0)(ptrs, stacked);
+
+      // Optional head-mean -> [T, F_enc].
+      StorageView reduced(dtype, device);
+      if (average_heads) {
+        // Mean over axis=1 (the num_heads axis).  ``ops::Mean`` keeps
+        // dims but writes the reduced shape, so the result is
+        // ``[T, 1, F_enc]``; we drop the singleton dim below.
+        ops::Mean(/*axis=*/1)(stacked, reduced);
+      } else {
+        reduced = std::move(stacked);
+      }
+
+      // Cast to float32 on the device (Python timing code expects fp32).
+      StorageView fp32(DataType::FLOAT32, device);
+      if (reduced.dtype() == DataType::FLOAT32)
+        fp32 = std::move(reduced);
+      else
+        fp32 = reduced.to(DataType::FLOAT32);
+
+      // Single bulk PCIe transfer to CPU.
+      StorageView cpu = fp32.to(Device::CPU);
+
+      // Squeeze the singleton ``num_heads`` axis when averaging so the
+      // Python side gets a clean ``[T, F_enc]`` array.
+      if (average_heads && cpu.rank() == 3 && cpu.dim(1) == 1)
+        cpu.squeeze(1);
+
+      return cpu;
+    }
+
+    std::pair<StorageView, StorageView>
+    WhisperReplica::forward_batch_with_attention(WhisperDecoderState& wds,
+                                                 const std::vector<size_t>& token_ids) {
+      PROFILE("WhisperReplica::forward_batch_with_attention");
+      require_alignment_heads_configured(*_decoder);
+
+#ifdef CT2_WITH_CUDA
+      const cuda::UseTrueFp16GemmInScope use_true_fp16_gemm(false);
+#endif
+
+      const auto scoped_device_setter = _model->get_scoped_device_setter();
+      const Device device = _decoder->device();
+      _decoder->update_output_layer(_model->preferred_size_multiple());
+
+      std::vector<std::vector<size_t>> batch = {token_ids};
+      const StorageView ids = layers::make_sequence_inputs(batch, device);
+
+      StorageView logits(_decoder->output_type(), device);
+      // For a multi-position (sequence) input the decoder writes the
+      // cross-attention as ``[1, num_selected_heads, T, F_enc]``
+      // (post-softmax, since set_alignment_heads enabled normalized
+      // attention).
+      StorageView attention(_decoder->output_type(), device);
+      _decoder->forward_with_logits(ids, wds.current_step, wds.state, logits, &attention);
+      wds.current_step += static_cast<dim_t>(token_ids.size());
+
+      // Head-average -> ``[1, 1, T, F]`` then drop the head + batch axes
+      // to a clean ``[T, F_enc]`` matrix on CPU (single bulk transfer).
+      StorageView reduced(attention.dtype(), device);
+      ops::Mean(/*axis=*/1)(attention, reduced);
+
+      StorageView fp32(DataType::FLOAT32, device);
+      if (reduced.dtype() == DataType::FLOAT32)
+        fp32 = std::move(reduced);
+      else
+        fp32 = reduced.to(DataType::FLOAT32);
+
+      StorageView cpu = fp32.to(Device::CPU);
+      // ``cpu`` is ``[1, 1, T, F]``: squeeze the head axis (1) then the
+      // batch axis (0).  Guard each squeeze in case a degenerate shape
+      // (e.g. T == 1) collapsed an axis earlier.
+      if (cpu.rank() == 4 && cpu.dim(1) == 1)
+        cpu.squeeze(1);
+      if (cpu.rank() == 3 && cpu.dim(0) == 1)
+        cpu.squeeze(0);
+
+      return {std::move(logits), std::move(cpu)};
+    }
+
+
+    std::future<std::pair<WhisperDecoderState, StorageView>>
+    Whisper::prefill(const StorageView& features,
+                     std::vector<size_t> prompt) {
+      return post<std::pair<WhisperDecoderState, StorageView>>(
+        [features = features.sync_copy(),
+         prompt = std::move(prompt)]
+        (WhisperReplica& replica) mutable {
+          return replica.prefill(std::move(features), prompt);
+        });
+    }
+
+    std::future<StorageView>
+    Whisper::forward_step(WhisperDecoderState& state,
+                          size_t token_id) {
+      return post<StorageView>(
+        [&state, token_id]
+        (WhisperReplica& replica) mutable {
+          return replica.forward_step(state, token_id);
+        });
+    }
+
+    std::future<StorageView>
+    Whisper::forward_batch(WhisperDecoderState& state,
+                           std::vector<size_t> token_ids) {
+      return post<StorageView>(
+        [&state, token_ids = std::move(token_ids)]
+        (WhisperReplica& replica) mutable {
+          return replica.forward_batch(state, token_ids);
+        });
+    }
+
+    std::future<size_t>
+    Whisper::forward_step_greedy(WhisperDecoderState& state,
+                                 size_t token_id,
+                                 std::vector<size_t> suppress_tokens) {
+      return post<size_t>(
+        [&state, token_id, suppress_tokens = std::move(suppress_tokens)]
+        (WhisperReplica& replica) mutable {
+          return replica.forward_step_greedy(state, token_id, suppress_tokens);
+        });
+    }
+
+    std::future<std::vector<size_t>>
+    Whisper::forward_batch_greedy(WhisperDecoderState& state,
+                                  std::vector<size_t> token_ids,
+                                  std::vector<size_t> suppress_tokens) {
+      return post<std::vector<size_t>>(
+        [&state, token_ids = std::move(token_ids),
+         suppress_tokens = std::move(suppress_tokens)]
+        (WhisperReplica& replica) mutable {
+          return replica.forward_batch_greedy(state, token_ids, suppress_tokens);
+        });
+    }
+
+    void
+    Whisper::set_alignment_heads(std::vector<std::pair<dim_t, dim_t>> heads) {
+      std::lock_guard<std::mutex> lock(_alignment_heads_mutex);
+      _alignment_heads = std::move(heads);
+    }
+
+    std::vector<std::pair<dim_t, dim_t>>
+    Whisper::get_alignment_heads_copy() const {
+      std::lock_guard<std::mutex> lock(_alignment_heads_mutex);
+      return _alignment_heads;
+    }
+
+    std::future<std::tuple<WhisperDecoderState, StorageView, StorageView>>
+    Whisper::prefill_with_attention(const StorageView& features,
+                                    std::vector<size_t> prompt) {
+      auto heads = get_alignment_heads_copy();
+      return post<std::tuple<WhisperDecoderState, StorageView, StorageView>>(
+        [features = features.sync_copy(),
+         prompt = std::move(prompt),
+         heads = std::move(heads)]
+        (WhisperReplica& replica) mutable {
+          replica.set_alignment_heads(heads);
+          return replica.prefill_with_attention(std::move(features), prompt);
+        });
+    }
+
+    std::future<std::pair<StorageView, StorageView>>
+    Whisper::forward_step_with_attention(WhisperDecoderState& state,
+                                         size_t token_id) {
+      auto heads = get_alignment_heads_copy();
+      return post<std::pair<StorageView, StorageView>>(
+        [&state, token_id, heads = std::move(heads)]
+        (WhisperReplica& replica) mutable {
+          replica.set_alignment_heads(heads);
+          return replica.forward_step_with_attention(state, token_id);
+        });
+    }
+
+    std::future<std::pair<size_t, StorageView>>
+    Whisper::forward_step_greedy_with_attention(WhisperDecoderState& state,
+                                                size_t token_id) {
+      auto heads = get_alignment_heads_copy();
+      return post<std::pair<size_t, StorageView>>(
+        [&state, token_id, heads = std::move(heads)]
+        (WhisperReplica& replica) mutable {
+          replica.set_alignment_heads(heads);
+          return replica.forward_step_greedy_with_attention(state, token_id);
+        });
+    }
+
+    std::future<std::pair<StorageView, StorageView>>
+    Whisper::forward_batch_with_attention(WhisperDecoderState& state,
+                                          std::vector<size_t> token_ids) {
+      auto heads = get_alignment_heads_copy();
+      return post<std::pair<StorageView, StorageView>>(
+        [&state, token_ids = std::move(token_ids), heads = std::move(heads)]
+        (WhisperReplica& replica) mutable {
+          replica.set_alignment_heads(heads);
+          return replica.forward_batch_with_attention(state, token_ids);
+        });
+    }
+
+    std::future<StorageView>
+    Whisper::collected_attention_to_cpu(const WhisperDecoderState& state,
+                                        bool average_heads) {
+      return post<StorageView>(
+        [&state, average_heads]
+        (WhisperReplica& replica) mutable {
+          return replica.collected_attention_to_cpu(state, average_heads);
+        });
+    }
+
+    std::future<std::pair<WhisperDecoderState, std::vector<size_t>>>
+    Whisper::generate_greedy_with_attention(
+        StorageView features,
+        std::vector<size_t> prompt,
+        size_t max_new_tokens,
+        size_t eot_id,
+        std::vector<size_t> suppress_tokens,
+        std::vector<size_t> ban_first_tokens) {
+      auto heads = get_alignment_heads_copy();
+      return post<std::pair<WhisperDecoderState, std::vector<size_t>>>(
+        [features = features.sync_copy(),
+         prompt = std::move(prompt),
+         max_new_tokens,
+         eot_id,
+         suppress_tokens = std::move(suppress_tokens),
+         ban_first_tokens = std::move(ban_first_tokens),
+         heads = std::move(heads)]
+        (WhisperReplica& replica) mutable {
+          replica.set_alignment_heads(heads);
+          return replica.generate_greedy_with_attention(
+              std::move(features),
+              prompt,
+              max_new_tokens,
+              eot_id,
+              suppress_tokens,
+              ban_first_tokens);
+        });
+    }
+
+    std::future<std::pair<std::vector<std::vector<size_t>>, std::vector<StorageView>>>
+    Whisper::generate_dual_greedy(
+        StorageView features,
+        std::vector<std::vector<size_t>> prompts,
+        size_t max_new_tokens,
+        size_t eot_id,
+        std::vector<size_t> suppress_tokens,
+        bool want_attention) {
+      auto heads = get_alignment_heads_copy();
+      return post<std::pair<std::vector<std::vector<size_t>>, std::vector<StorageView>>>(
+        [features = features.sync_copy(),
+         prompts = std::move(prompts),
+         max_new_tokens,
+         eot_id,
+         suppress_tokens = std::move(suppress_tokens),
+         want_attention,
+         heads = std::move(heads)]
+        (WhisperReplica& replica) mutable {
+          if (want_attention)
+            replica.set_alignment_heads(heads);
+          return replica.generate_dual_greedy(
+              std::move(features),
+              prompts,
+              max_new_tokens,
+              eot_id,
+              suppress_tokens,
+              want_attention);
+        });
+    }
+
+    std::future<std::vector<size_t>>
+    Whisper::generate_speculative(
+        Whisper& draft_pool,
+        StorageView main_features,
+        StorageView draft_features,
+        std::vector<size_t> prompt,
+        size_t num_speculative_tokens,
+        size_t max_length,
+        size_t eot_id,
+        std::vector<size_t> suppress_tokens,
+        std::vector<int32_t> d2m,
+        std::vector<int32_t> m2d,
+        size_t min_speculative_tokens,
+        size_t max_speculative_tokens,
+        bool reset_adaptive_state) {
+      return post<std::vector<size_t>>(
+        [&draft_pool,
+         main_features = main_features.sync_copy(),
+         draft_features = draft_features.sync_copy(),
+         prompt = std::move(prompt),
+         num_speculative_tokens,
+         max_length,
+         eot_id,
+         suppress_tokens = std::move(suppress_tokens),
+         d2m = std::move(d2m),
+         m2d = std::move(m2d),
+         min_speculative_tokens,
+         max_speculative_tokens,
+         reset_adaptive_state]
+        (WhisperReplica& replica) mutable {
+          // Drive the draft model's replica directly from this (main)
+          // worker thread; no job is posted to the draft pool, so both
+          // models share one CUDA stream and never race.
+          WhisperReplica& draft_replica = draft_pool.get_first_replica_mutable();
+          return replica.generate_speculative(
+              draft_replica,
+              std::move(main_features),
+              std::move(draft_features),
+              prompt,
+              num_speculative_tokens,
+              max_length,
+              eot_id,
+              suppress_tokens,
+              d2m,
+              m2d,
+              min_speculative_tokens,
+              max_speculative_tokens,
+              reset_adaptive_state);
+        });
     }
 
 

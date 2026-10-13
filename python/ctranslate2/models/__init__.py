@@ -3,6 +3,8 @@
 try:
     from ctranslate2._ext import (
         Whisper,
+        WhisperAlignmentResult,
+        WhisperDecoderState,
         WhisperGenerationResult,
         WhisperGenerationResultAsync,
     )

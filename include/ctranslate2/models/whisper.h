@@ -1,5 +1,9 @@
 #pragma once
 
+#include <mutex>
+#include <tuple>
+#include <utility>
+
 #include "ctranslate2/decoding.h"
 #include "ctranslate2/vocabulary.h"
 #include "ctranslate2/layers/whisper.h"
@@ -80,6 +84,37 @@ namespace ctranslate2 {
       std::vector<float> text_token_probs;
     };
 
+    struct WhisperDecoderState {
+      layers::DecoderState state;
+      dim_t current_step = 0;
+      // Per-step cross-attention rows captured during incremental
+      // decoding.  Each entry has shape ``[1, num_selected_heads,
+      // F_enc]`` (post-softmax, so each (batch, head, :) row sums to 1
+      // over encoder frames) and lives on the model's device.
+      // Populated only by the ``*_with_attention`` APIs.  Index ``k``
+      // corresponds to the attention emitted when predicting the
+      // (prompt_len+k)-th token, i.e. the row matching the k-th
+      // generated token (0-indexed).
+      std::vector<StorageView> collected_attention;
+
+      WhisperDecoderState() = default;
+      WhisperDecoderState(WhisperDecoderState&&) = default;
+      WhisperDecoderState& operator=(WhisperDecoderState&&) = default;
+
+      WhisperDecoderState deep_copy() const {
+        WhisperDecoderState copy;
+        copy.current_step = current_step;
+        for (const auto& kv : state)
+          copy.state.emplace(kv.first, StorageView(kv.second));
+        copy.collected_attention.reserve(collected_attention.size());
+        for (const auto& a : collected_attention)
+          copy.collected_attention.emplace_back(a);
+        return copy;
+      }
+
+      void truncate_to_step(dim_t target_step);
+    };
+
     class WhisperModel : public Model {
     public:
       const Vocabulary& get_vocabulary() const;
@@ -135,6 +170,191 @@ namespace ctranslate2 {
             std::vector<size_t> num_frames,
             dim_t median_filter_width);
 
+      std::pair<WhisperDecoderState, StorageView>
+      prefill(StorageView features,
+              const std::vector<size_t>& prompt);
+
+      StorageView forward_step(WhisperDecoderState& state,
+                               size_t token_id);
+
+      StorageView forward_batch(WhisperDecoderState& state,
+                                const std::vector<size_t>& token_ids);
+
+      // ``suppress_tokens`` (main-vocab IDs) are masked to -inf on the
+      // device before the argmax, so token suppression stays on the fast
+      // greedy path (no full-vocab logits transfer to Python).  An empty
+      // list means no suppression.
+      size_t forward_step_greedy(WhisperDecoderState& state,
+                                 size_t token_id,
+                                 const std::vector<size_t>& suppress_tokens = {});
+
+      std::vector<size_t> forward_batch_greedy(WhisperDecoderState& state,
+                                               const std::vector<size_t>& token_ids,
+                                               const std::vector<size_t>& suppress_tokens = {});
+
+      // Like ``forward_batch`` but also returns the per-position
+      // post-softmax cross-attention over encoder frames for the selected
+      // alignment heads.  Used by speculative decoding's word-timing path
+      // to recover main-model attention for the always-verified token and
+      // for verifier-correction tokens in the same batched pass (no extra
+      // compute).  ``attention`` is head-averaged and returned on CPU with
+      // shape ``[T, F_enc]`` (T = ``token_ids.size()``); ``attention[i]``
+      // is the row used to predict the token following ``token_ids[i]``.
+      // Requires ``set_alignment_heads([...])`` first.
+      std::pair<StorageView, StorageView>
+      forward_batch_with_attention(WhisperDecoderState& state,
+                                   const std::vector<size_t>& token_ids);
+
+      // Configure which (layer, head) cross-attention rows to collect on
+      // subsequent ``*_with_attention`` calls.  Also enables post-softmax
+      // attention output on the decoder.  Pass an empty list to disable
+      // collection (and revert the decoder to its default raw-attention
+      // mode used by ``align()``).
+      void set_alignment_heads(const std::vector<std::pair<dim_t, dim_t>>& heads);
+
+      // Like ``prefill`` but also returns the post-softmax cross-attention
+      // row at the first generation position (i.e. the attention emitted
+      // when the last prompt token is fed and the model predicts the
+      // first new token).  The row is also appended to
+      // ``state.collected_attention``.
+      std::tuple<WhisperDecoderState, StorageView, StorageView>
+      prefill_with_attention(StorageView features,
+                             const std::vector<size_t>& prompt);
+
+      // Like ``forward_step`` but also returns the cross-attention row
+      // for this step and appends it to ``state.collected_attention``.
+      std::pair<StorageView, StorageView>
+      forward_step_with_attention(WhisperDecoderState& state,
+                                  size_t token_id);
+
+      // Like ``forward_step_greedy`` but also captures the cross-attention
+      // row.  The greedy argmax stays on the GPU; only the (small)
+      // attention row plus the picked token id leave the device.
+      std::pair<size_t, StorageView>
+      forward_step_greedy_with_attention(WhisperDecoderState& state,
+                                         size_t token_id);
+
+      // Concatenate ``state.collected_attention`` along the time axis,
+      // optionally average over the heads dimension, cast to float32,
+      // and transfer the result to CPU in a single bulk PCIe copy.
+      //
+      // Output shape:
+      //   * ``average_heads = true``  -> ``[T, F_enc]``
+      //   * ``average_heads = false`` -> ``[T, num_heads, F_enc]``
+      //
+      // Returns an empty StorageView (size 0) when no rows are buffered.
+      // ``state`` is not mutated.
+      StorageView collected_attention_to_cpu(const WhisperDecoderState& state,
+                                             bool average_heads = true) const;
+
+      // Runs a full greedy decode loop with on-GPU argmax and per-step
+      // cross-attention capture, all inside a single thread-pool job
+      // (no Python round-trip per step).  Used by CrisperWhisper's
+      // word-timing pipeline to avoid the dispatch / logits-to-CPU
+      // overhead of doing the same thing from Python.
+      //
+      // ``suppress_tokens`` are masked at every step.
+      // ``ban_first_tokens`` are masked **only** on the first step --
+      // this is how the hallucination-repair "escape" round forces
+      // the model away from the loop-starting token.
+      //
+      // Stops on the first ``eot_id`` emission or after
+      // ``max_new_tokens`` steps.  Returns the new state (with
+      // ``collected_attention`` populated) and the generated token
+      // list (which may end with ``eot_id`` when EOT was emitted).
+      std::pair<WhisperDecoderState, std::vector<size_t>>
+      generate_greedy_with_attention(StorageView features,
+                                     const std::vector<size_t>& prompt,
+                                     size_t max_new_tokens,
+                                     size_t eot_id,
+                                     const std::vector<size_t>& suppress_tokens,
+                                     const std::vector<size_t>& ban_first_tokens);
+
+      // Greedy-decode several prompts that share the **same** audio in a
+      // single batched decoder pass -- the encoder runs once and each row
+      // decodes independently.  Used to produce e.g. verbatim and intended
+      // transcripts (plus their word-timing cross-attention) at close to the
+      // cost of one decode.
+      //
+      // The prompts may have *different* lengths (their continuation
+      // contexts differ).  Because Whisper uses absolute positions, padding
+      // cannot equalise them; instead the shorter prompts are advanced with
+      // their own real greedy tokens ("catch-up") until every active row sits
+      // at the same length, after which the rows are decoded together in
+      // lockstep.  The result is token-for-token identical to decoding each
+      // prompt on its own with ``generate_greedy_with_attention`` (greedy,
+      // same suppression).  A row that emits ``eot_id`` during catch-up is
+      // finished immediately and excluded from the batched phase.
+      //
+      // ``suppress_tokens`` (main-vocab ids) are masked on the device before
+      // every argmax.  Output ids are per row, in prompt order, and include
+      // the trailing ``eot_id`` when that row stopped on EOT (matching
+      // ``generate_greedy_with_attention``).
+      //
+      // ``want_attention``: when true, requires ``set_alignment_heads([...])``
+      // first and returns, per row, the head-averaged post-softmax
+      // cross-attention as a CPU ``[len(ids_row), F_enc]`` float32 matrix
+      // (1-to-1 with that row's ids).  When false the second element is a
+      // list of empty StorageViews.
+      std::pair<std::vector<std::vector<size_t>>, std::vector<StorageView>>
+      generate_dual_greedy(StorageView features,
+                           const std::vector<std::vector<size_t>>& prompts,
+                           size_t max_new_tokens,
+                           size_t eot_id,
+                           const std::vector<size_t>& suppress_tokens,
+                           bool want_attention);
+
+      // Runs the entire *strict* speculative-decoding loop natively inside
+      // a single thread-pool job: this replica is the verifier ("main"),
+      // ``draft`` proposes ``num_speculative_tokens`` tokens per round,
+      // and the main model verifies them in one batched pass.  KV-caches
+      // for both models are kept on the device and only the picked token
+      // ids cross to the host -- no per-token Python dispatch.
+      //
+      // Both models run on *this* worker thread (one CUDA stream), so the
+      // draft state and main state never race.  ``draft`` may alias
+      // ``*this`` (same-model draft): the two decoder states are
+      // independent so this is safe.
+      //
+      // Token-space translation between the two vocabularies is supplied
+      // as lookup tables: ``d2m[draft_id] -> main_id`` and
+      // ``m2d[main_id] -> draft_id`` (value -1 means "unmapped").  An
+      // *empty* table means the identity mapping (same vocabulary).
+      //
+      // ``suppress_tokens`` (main-vocab ids) are masked on the device
+      // before every main-model argmax (prefill, verify, rollback),
+      // exactly matching a non-speculative suppressed decode.  The
+      // returned ids are in main-vocab space and include the trailing
+      // ``eot_id`` when generation stopped on EOT.
+      //
+      // Adaptive K: when ``max_speculative_tokens > min_speculative_tokens``
+      // the number of tokens drafted per round self-tunes to the draft's
+      // acceptance with a symmetric +1/-1 controller -- a round where every
+      // drafted token is accepted bumps K up by one, any rejection nudges it
+      // down by one -- clamped to ``[min_speculative_tokens,
+      // max_speculative_tokens]``.  The controller's K *persists across
+      // calls* (stored on the replica) so that, over a chunked transcription,
+      // it converges to the per-audio equilibrium (where ~half the rounds
+      // fully accept) regardless of the seed.  Pass ``reset_adaptive_state``
+      // on the first chunk of a new audio to re-seed K from
+      // ``num_speculative_tokens``; pass it false on subsequent chunks to
+      // keep converging.  Pass ``max_speculative_tokens == 0`` (the default)
+      // to keep K fixed at ``num_speculative_tokens``.
+      std::vector<size_t>
+      generate_speculative(WhisperReplica& draft,
+                           StorageView main_features,
+                           StorageView draft_features,
+                           const std::vector<size_t>& prompt,
+                           size_t num_speculative_tokens,
+                           size_t max_length,
+                           size_t eot_id,
+                           const std::vector<size_t>& suppress_tokens,
+                           const std::vector<int32_t>& d2m,
+                           const std::vector<int32_t>& m2d,
+                           size_t min_speculative_tokens = 0,
+                           size_t max_speculative_tokens = 0,
+                           bool reset_adaptive_state = true);
+
     private:
       const std::shared_ptr<const WhisperModel> _model;
       const std::unique_ptr<layers::WhisperEncoder> _encoder;
@@ -147,6 +367,10 @@ namespace ctranslate2 {
       size_t _n_mels;
       size_t _num_languages;
       bool _is_multilingual;
+
+      // Persistent adaptive-K controller state (see generate_speculative).
+      // <= 0 means "uninitialised": the next adaptive call seeds it.
+      double _spec_k_state = 0.0;
 
       StorageView maybe_encode(StorageView features);
     };
@@ -181,6 +405,110 @@ namespace ctranslate2 {
             std::vector<size_t> num_frames,
             dim_t median_filter_width);
 
+      std::future<std::pair<WhisperDecoderState, StorageView>>
+      prefill(const StorageView& features,
+              std::vector<size_t> prompt);
+
+      std::future<StorageView>
+      forward_step(WhisperDecoderState& state,
+                   size_t token_id);
+
+      std::future<StorageView>
+      forward_batch(WhisperDecoderState& state,
+                    std::vector<size_t> token_ids);
+
+      std::future<size_t>
+      forward_step_greedy(WhisperDecoderState& state,
+                          size_t token_id,
+                          std::vector<size_t> suppress_tokens = {});
+
+      std::future<std::vector<size_t>>
+      forward_batch_greedy(WhisperDecoderState& state,
+                           std::vector<size_t> token_ids,
+                           std::vector<size_t> suppress_tokens = {});
+
+      // Configure the (layer, head) cross-attention rows to collect on
+      // subsequent ``*_with_attention`` calls.  The configuration is
+      // stored on the pool and re-applied to whichever replica handles
+      // each request, so it works correctly with multiple replicas.
+      // Pass an empty vector to disable collection.
+      void set_alignment_heads(std::vector<std::pair<dim_t, dim_t>> heads);
+
+      std::future<std::tuple<WhisperDecoderState, StorageView, StorageView>>
+      prefill_with_attention(const StorageView& features,
+                             std::vector<size_t> prompt);
+
+      std::future<std::pair<StorageView, StorageView>>
+      forward_step_with_attention(WhisperDecoderState& state,
+                                  size_t token_id);
+
+      std::future<std::pair<size_t, StorageView>>
+      forward_step_greedy_with_attention(WhisperDecoderState& state,
+                                         size_t token_id);
+
+      // Async wrapper around ``WhisperReplica::forward_batch_with_attention``.
+      // Returns ``(logits, attention)`` where ``attention`` is the
+      // head-averaged per-position cross-attention on CPU ``[T, F_enc]``.
+      std::future<std::pair<StorageView, StorageView>>
+      forward_batch_with_attention(WhisperDecoderState& state,
+                                   std::vector<size_t> token_ids);
+
+      // Async wrapper around ``WhisperReplica::generate_greedy_with_attention``.
+      // The whole greedy loop runs inside one replica job, so the Python
+      // caller pays a single round-trip per generation segment instead of
+      // one per token.  ``ban_first_tokens`` is applied only on the
+      // first step (used to break loop-starting tokens during repair).
+      std::future<std::pair<WhisperDecoderState, std::vector<size_t>>>
+      generate_greedy_with_attention(StorageView features,
+                                     std::vector<size_t> prompt,
+                                     size_t max_new_tokens,
+                                     size_t eot_id,
+                                     std::vector<size_t> suppress_tokens,
+                                     std::vector<size_t> ban_first_tokens);
+
+      // Async wrapper around ``WhisperReplica::generate_dual_greedy``.  The
+      // whole batched (catch-up + lockstep) decode runs inside one job, so
+      // the Python caller pays a single round-trip for both transcripts.
+      std::future<std::pair<std::vector<std::vector<size_t>>, std::vector<StorageView>>>
+      generate_dual_greedy(StorageView features,
+                           std::vector<std::vector<size_t>> prompts,
+                           size_t max_new_tokens,
+                           size_t eot_id,
+                           std::vector<size_t> suppress_tokens,
+                           bool want_attention);
+
+      // Async wrapper around ``WhisperReplica::generate_speculative``.
+      // The whole strict speculative loop runs inside one job on *this*
+      // pool's worker thread; ``draft_pool``'s first replica is driven
+      // directly from that same thread (no job is posted to it), so the
+      // Python caller pays a single round-trip per generated segment.
+      std::future<std::vector<size_t>>
+      generate_speculative(Whisper& draft_pool,
+                           StorageView main_features,
+                           StorageView draft_features,
+                           std::vector<size_t> prompt,
+                           size_t num_speculative_tokens,
+                           size_t max_length,
+                           size_t eot_id,
+                           std::vector<size_t> suppress_tokens,
+                           std::vector<int32_t> d2m,
+                           std::vector<int32_t> m2d,
+                           size_t min_speculative_tokens = 0,
+                           size_t max_speculative_tokens = 0,
+                           bool reset_adaptive_state = true);
+
+      // Async wrapper for the bulk attention transfer.  Performs the
+      // concat + (optional) head-mean on the device that owns the state,
+      // then copies once to CPU.
+      std::future<StorageView>
+      collected_attention_to_cpu(const WhisperDecoderState& state,
+                                 bool average_heads = true);
+
+    private:
+      std::vector<std::pair<dim_t, dim_t>> _alignment_heads;
+      mutable std::mutex _alignment_heads_mutex;
+
+      std::vector<std::pair<dim_t, dim_t>> get_alignment_heads_copy() const;
     };
 
   }
