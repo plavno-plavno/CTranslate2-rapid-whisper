@@ -645,28 +645,35 @@ namespace ctranslate2 {
       if (graph_it == buffers.graphs.end()) {
         // Capture. Nothing runs on the device here: decode() only records its kernels,
         // while its host side updates the state entries to views of the output buffers.
+        // The capture runs on a non-blocking stream of this thread (see
+        // cuda::get_capture_stream), the graph is then launched on the regular stream.
         _capture_cache_targets = &buffers.targets[out];
         std::string error;
-        CUDA_CHECK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal));
-        try {
-          decode(buffers.ids, nullptr, step, state, &buffers.logits, nullptr, true);
-          if (greedy)
-            select_greedy_on_device(buffers.logits,
-                                    *greedy,
-                                    *disable_indices,
-                                    graphs.id_table,
-                                    buffers.result_ids,
-                                    buffers.result_scores,
-                                    (step % StepGraphs::num_result_slots) * batch_size,
-                                    buffers.ids);
-        } catch (const std::exception& e) {
-          error = e.what();
-        }
-        _capture_cache_targets = nullptr;
-        self_attention_cache_target() = nullptr;
-
         cudaGraph_t graph = nullptr;
-        cudaError_t status = cudaStreamEndCapture(stream, &graph);
+        cudaError_t status = cudaSuccess;
+        {
+          const cudaStream_t capture_stream = cuda::get_capture_stream();
+          const cuda::ScopedCudaStream scoped_stream(capture_stream);
+          CUDA_CHECK(cudaStreamBeginCapture(capture_stream, cudaStreamCaptureModeThreadLocal));
+          try {
+            decode(buffers.ids, nullptr, step, state, &buffers.logits, nullptr, true);
+            if (greedy)
+              select_greedy_on_device(buffers.logits,
+                                      *greedy,
+                                      *disable_indices,
+                                      graphs.id_table,
+                                      buffers.result_ids,
+                                      buffers.result_scores,
+                                      (step % StepGraphs::num_result_slots) * batch_size,
+                                      buffers.ids);
+          } catch (const std::exception& e) {
+            error = e.what();
+          }
+          _capture_cache_targets = nullptr;
+          self_attention_cache_target() = nullptr;
+
+          status = cudaStreamEndCapture(capture_stream, &graph);
+        }
         cudaGraphExec_t exec = nullptr;
         if (error.empty() && status == cudaSuccess)
           status = cudaGraphInstantiate(&exec, graph, 0);

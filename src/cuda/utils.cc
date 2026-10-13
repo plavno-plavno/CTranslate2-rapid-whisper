@@ -95,9 +95,48 @@ namespace ctranslate2 {
     // We create one cuBLAS/cuDNN handle per host thread. The handle is destroyed
     // when the thread exits.
 
+    static thread_local cudaStream_t stream_override = nullptr;
+
     cudaStream_t get_cuda_stream() {
+      if (stream_override)
+        return stream_override;
       static thread_local CudaStream cuda_stream;
       return cuda_stream.get();
+    }
+
+    class CudaCaptureStream {
+    public:
+      CudaCaptureStream() {
+        CUDA_CHECK(cudaGetDevice(&_device));
+        CUDA_CHECK(cudaStreamCreateWithFlags(&_stream, cudaStreamNonBlocking));
+      }
+      ~CudaCaptureStream() {
+        ScopedDeviceSetter scoped_device_setter(Device::CUDA, _device);
+        cudaStreamDestroy(_stream);
+      }
+      cudaStream_t get() const {
+        return _stream;
+      }
+    private:
+      int _device;
+      cudaStream_t _stream;
+    };
+
+    cudaStream_t get_capture_stream() {
+      static thread_local CudaCaptureStream capture_stream;
+      return capture_stream.get();
+    }
+
+    ScopedCudaStream::ScopedCudaStream(cudaStream_t stream)
+      : _previous(stream_override)
+    {
+      stream_override = stream;
+      CUBLAS_CHECK(cublasSetStream(get_cublas_handle(), get_cuda_stream()));
+    }
+
+    ScopedCudaStream::~ScopedCudaStream() {
+      stream_override = _previous;
+      cublasSetStream(get_cublas_handle(), get_cuda_stream());
     }
 
     cublasHandle_t get_cublas_handle() {

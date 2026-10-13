@@ -50,6 +50,23 @@ namespace ctranslate2 {
 
     cudaStream_t get_cuda_stream();
     cublasHandle_t get_cublas_handle();
+
+    // A non-blocking stream of the current thread, used to capture CUDA graphs: capturing
+    // on a blocking stream fails as soon as another thread of the process (e.g. an
+    // onnxruntime session) uses the legacy default stream, and invalidates the capture.
+    cudaStream_t get_capture_stream();
+
+    // Makes get_cuda_stream() (and the thread's cuBLAS handle) use another stream in
+    // the current thread for the lifetime of the object.
+    class ScopedCudaStream {
+    public:
+      explicit ScopedCudaStream(cudaStream_t stream);
+      ~ScopedCudaStream();
+      ScopedCudaStream(const ScopedCudaStream&) = delete;
+      ScopedCudaStream& operator=(const ScopedCudaStream&) = delete;
+    private:
+      cudaStream_t _previous;
+    };
 #ifdef CT2_WITH_CUDNN
     cudnnHandle_t get_cudnn_handle();
     cudnnDataType_t get_cudnn_data_type(DataType dtype);
