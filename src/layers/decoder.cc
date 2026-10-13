@@ -10,6 +10,25 @@
 namespace ctranslate2 {
   namespace layers {
 
+    static bool& step_graphs_active() {
+      static thread_local bool active = false;
+      return active;
+    }
+
+    ScopedStepGraphs::ScopedStepGraphs()
+      : _previous(step_graphs_active())
+    {
+      step_graphs_active() = true;
+    }
+
+    ScopedStepGraphs::~ScopedStepGraphs() {
+      step_graphs_active() = _previous;
+    }
+
+    bool ScopedStepGraphs::active() {
+      return step_graphs_active();
+    }
+
     Decoder::Decoder(Device device)
       : _device(device) {
     }

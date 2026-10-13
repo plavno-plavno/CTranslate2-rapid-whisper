@@ -239,6 +239,9 @@ namespace ctranslate2 {
       if (prompts.empty())
         return {};
 
+      // The search below decodes a single state owned by this call.
+      const layers::ScopedStepGraphs scoped_step_graphs;
+
 #ifdef CT2_WITH_CUDA
       const cuda::UseTrueFp16GemmInScope use_true_fp16_gemm(false);
 #endif

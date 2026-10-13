@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <list>
 #include <map>
 #include <tuple>
 
@@ -349,16 +350,44 @@ namespace ctranslate2 {
         }
       };
 
-      // (batch, heads, head depth, memory keys shape) -> buffers
-      std::map<std::tuple<dim_t, dim_t, dim_t, Shape>, Buffers> buffers;
+      // (batch, heads, head depth, memory keys shape) -> buffers. A set costs the
+      // self-attention caches at full capacity plus the cross-attention keys/values
+      // (0.4 GB for large-v3 batch 1, ~2 GB at batch 5), so only the most recently used
+      // sets are kept (CT2_CUDA_GRAPHS_MAX_BUFFER_SETS, default 2).
+      using BufferKey = std::tuple<dim_t, dim_t, dim_t, Shape>;
+      std::map<BufferKey, Buffers> buffers;
+      std::list<BufferKey> recently_used;
       std::vector<GreedyStepOptions> greedy_options;
       StorageView id_table;  // Output id -> original vocabulary id, on the device.
       Buffers* last_greedy_buffers = nullptr;
       dim_t output_layer_version = -1;
       bool disabled = false;
 
+      void touch(const BufferKey& key) {
+        recently_used.remove(key);
+        recently_used.push_front(key);
+      }
+
+      // Frees the least recently used sets beyond max_sets, never `keep`. The state no
+      // longer views them: it was staged into `keep` before this is called.
+      void evict(const BufferKey& keep, size_t max_sets) {
+        while (buffers.size() > max_sets && recently_used.size() > 1) {
+          const BufferKey victim = recently_used.back();
+          if (victim == keep)
+            break;
+          // Pending work may still read the victim's buffers (state staging copies).
+          cudaStreamSynchronize(cuda::get_cuda_stream());
+          auto it = buffers.find(victim);
+          if (last_greedy_buffers == &it->second)
+            last_greedy_buffers = nullptr;
+          buffers.erase(it);
+          recently_used.pop_back();
+        }
+      }
+
       void clear() {
         buffers.clear();
+        recently_used.clear();
         greedy_options.clear();
         id_table = StorageView();
         last_greedy_buffers = nullptr;
@@ -397,7 +426,7 @@ namespace ctranslate2 {
                            StepGraphs::num_result_slots));
       static const bool device_greedy = read_bool_from_env("CT2_CUDA_GRAPHS_DEVICE_GREEDY", true);
       if (!cuda_graphs_enabled() || !device_greedy || _device != Device::CUDA
-          || (_step_graphs && _step_graphs->disabled))
+          || !ScopedStepGraphs::active() || (_step_graphs && _step_graphs->disabled))
         return 0;
       return max_queued;
     }
@@ -501,9 +530,10 @@ namespace ctranslate2 {
       const DataType dtype = output_type();
       const dim_t output_size = this->output_size();
 
-      auto [buffers_it, inserted] = graphs.buffers.try_emplace(
-        std::make_tuple(batch_size, num_heads, depth, memory_shape));
+      const StepGraphs::BufferKey buffers_key(batch_size, num_heads, depth, memory_shape);
+      auto [buffers_it, inserted] = graphs.buffers.try_emplace(buffers_key);
       StepGraphs::Buffers& buffers = buffers_it->second;
+      graphs.touch(buffers_key);
       if (inserted) {
         // Allocate all persistent buffers at their final capacity, once: their addresses
         // are baked into the graphs.
@@ -601,6 +631,9 @@ namespace ctranslate2 {
       } else {
         buffers.ids.reshape({batch_size});
       }
+      static const size_t max_buffer_sets = std::max(
+        1, read_int_from_env("CT2_CUDA_GRAPHS_MAX_BUFFER_SETS", 2));
+      graphs.evict(buffers_key, max_buffer_sets);
 
       cudaStream_t stream = cuda::get_cuda_stream();
       const StepGraphs::GraphKey graph_key(step,
@@ -755,6 +788,7 @@ namespace ctranslate2 {
                                         StorageView* attention) {
 #ifdef CT2_WITH_CUDA
       if (logits && !attention && step > 0 && ids.rank() == 1 && _device == Device::CUDA
+          && ScopedStepGraphs::active()
           && cuda_graphs_enabled() && run_step_graph(step, &ids, state, logits, nullptr, false))
         return;
 #endif

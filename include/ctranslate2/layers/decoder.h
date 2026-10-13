@@ -13,6 +13,19 @@ namespace ctranslate2 {
 
     using DecoderState = std::unordered_map<std::string, StorageView>;
 
+    // CUDA graph steps leave the decoder state as views of buffers shared by every state
+    // of the same shape. They are only safe while a single state is being decoded, so they
+    // are enabled only inside the model's own decoding loops (e.g. Whisper generate), not
+    // for states held and stepped by the caller.
+    class ScopedStepGraphs {
+    public:
+      ScopedStepGraphs();
+      ~ScopedStepGraphs();
+      static bool active();
+    private:
+      const bool _previous;
+    };
+
     // Base class for decoders.
     class Decoder : public Layer {
     public:
