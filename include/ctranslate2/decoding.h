@@ -49,6 +49,15 @@ namespace ctranslate2 {
            const bool include_eos_in_hypotheses = true,
            const std::vector<std::shared_ptr<LogitsProcessor>>& logits_processors = {},
            const std::vector<std::vector<size_t>>* prefix_ids = nullptr) const = 0;
+
+    // Prefix tokens the caller already forwarded into the decoder state: they are not
+    // in the hypotheses during the search but count in the length used to normalize scores.
+    void set_hypothesis_length_offset(const dim_t offset) {
+      _hypothesis_length_offset = offset;
+    }
+
+  protected:
+    dim_t _hypothesis_length_offset = 0;
   };
 
   class BeamSearch : public SearchStrategy {
@@ -163,6 +172,11 @@ namespace ctranslate2 {
     std::vector<std::vector<size_t>> disable_sequences;
     std::vector<std::shared_ptr<LogitsProcessor>> logits_processors;
     std::function<bool(DecodingStepResult)> callback = nullptr;
+    // Number of hard prefix tokens the caller forwarded into the decoder state in one
+    // pass instead of passing them in start_tokens. Decoding then behaves as if they had
+    // been forced step by step: they count in the hypothesis length for score
+    // normalization and the first free step is handled as the step after a prefix.
+    dim_t folded_prefix_length = 0;
   };
 
   std::vector<DecodingResult>

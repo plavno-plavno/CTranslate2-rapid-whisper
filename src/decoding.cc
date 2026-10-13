@@ -240,11 +240,12 @@ namespace ctranslate2 {
                                      const float coverage_penalty,
                                      const bool keep_scores,
                                      const bool keep_attention,
-                                     const bool keep_logits_vocab) {
+                                     const bool keep_logits_vocab,
+                                     const dim_t length_offset) {
     for (size_t i = 0; i < result.scores.size(); ++i) {
       const auto* attention = result.attention.empty() ? nullptr : &result.attention[i];
       result.scores[i] = finalize_hypothesis_score(result.scores[i],
-                                                   result.hypotheses[i].size(),
+                                                   result.hypotheses[i].size() + length_offset,
                                                    length_penalty,
                                                    coverage_penalty,
                                                    attention);
@@ -663,7 +664,8 @@ namespace ctranslate2 {
                           _coverage_penalty,
                           return_scores,
                           return_attention,
-                          return_logits_vocab);
+                          return_logits_vocab,
+                          _hypothesis_length_offset);
         } else {
           non_finished_index.emplace_back(i);
         }
@@ -945,7 +947,8 @@ namespace ctranslate2 {
                           _coverage_penalty,
                           return_scores,
                           return_attention,
-                          return_logits_vocab);
+                          return_logits_vocab,
+                          _hypothesis_length_offset);
         } else {
           non_finished_index.emplace_back(i);
           sample_from.at<int32_t>(i) = word_id;
@@ -1075,16 +1078,19 @@ namespace ctranslate2 {
 
   static std::unique_ptr<const SearchStrategy>
   make_search_strategy(const DecodingOptions& options) {
+    std::unique_ptr<SearchStrategy> strategy;
     if (options.beam_size == 1 && options.prefix_bias_beta == 0)
-      return std::make_unique<GreedySearch>(options.length_penalty,
-                                            options.coverage_penalty,
-                                            options.callback);
+      strategy = std::make_unique<GreedySearch>(options.length_penalty,
+                                                options.coverage_penalty,
+                                                options.callback);
     else
-      return std::make_unique<BeamSearch>(options.beam_size,
-                                          options.length_penalty,
-                                          options.coverage_penalty,
-                                          options.prefix_bias_beta,
-                                          options.patience);
+      strategy = std::make_unique<BeamSearch>(options.beam_size,
+                                              options.length_penalty,
+                                              options.coverage_penalty,
+                                              options.prefix_bias_beta,
+                                              options.patience);
+    strategy->set_hypothesis_length_offset(options.folded_prefix_length);
+    return strategy;
   }
 
   static std::vector<std::shared_ptr<LogitsProcessor>>
@@ -1344,6 +1350,10 @@ namespace ctranslate2 {
       std::vector<size_t> start_ids;
       std::vector<std::vector<size_t>> prefix_ids;
       std::tie(start_ids, prefix_ids) = split_start_tokens(start_tokens);
+      // A folded prefix ended right before the start token: keep the search in prefix
+      // mode (empty prefixes) so the first free step is treated as after a forced prefix.
+      if (options.folded_prefix_length > 0 && prefix_ids.empty())
+        prefix_ids.assign(batch_size, {});
 
       const auto search_strategy = make_search_strategy(options);
       const auto sampler = make_sampler(options);

@@ -6,6 +6,7 @@
 
 #include "dispatch.h"
 #include "dtw.h"
+#include "env.h"
 
 #ifdef CT2_WITH_CUDA
 #  include "cuda/utils.h"
@@ -258,7 +259,38 @@ namespace ctranslate2 {
       std::vector<float> no_speech_probs;
       dim_t start_step = 0;
 
-      if (prompt_length == 1) {
+      // Text tokens after the task tokens are a hard prefix. Decoding them as start
+      // tokens costs one decoder step per token; when every prompt has the same length
+      // they can instead go through forward_prompt in a single pass. The search is then
+      // told about the folded tokens (DecodingOptions::folded_prefix_length) so that it
+      // behaves as after a forced prefix. Only for options under which the forced steps
+      // have no other effect: no timestamp rules, no repetition penalties (they look at
+      // the prefix tokens), no sampling (the prefix steps consume random draws) and no
+      // per-step logits (they are returned for the prefix steps too).
+      // Opt-in (CT2_WHISPER_FOLD_PREFIX=1): the single-pass forward rounds differently
+      // in half precision than step-by-step decoding, so scores (and rarely beam search
+      // tokens) are not bit-identical to the default path.
+      static const bool fold_prefix_enabled = read_bool_from_env("CT2_WHISPER_FOLD_PREFIX", false);
+      const size_t full_length = prompts[0].size();
+      const dim_t total_max_length = options.max_length;
+      const dim_t unfolded_max_length = std::min(total_max_length / 2,
+                                                 total_max_length - dim_t(prompt_length - 1));
+      const dim_t prefix_length = dim_t(full_length) - dim_t(prompt_length);
+      const bool fold_prefix = (fold_prefix_enabled
+                                && prefix_length > 0
+                                && prefix_length < unfolded_max_length
+                                && prompts[0][prompt_length - 1] == _no_timestamps_id
+                                && options.sampling_topk == 1
+                                && options.repetition_penalty == 1
+                                && options.no_repeat_ngram_size == 0
+                                && !options.return_logits_vocab
+                                && std::all_of(prompts.begin(), prompts.end(),
+                                               [full_length](const std::vector<size_t>& p) {
+                                                 return p.size() == full_length;
+                                               }));
+      const size_t split = fold_prefix ? full_length - 1 : prompt_length - 1;
+
+      if (split == 0) {
         start_tokens = prompts;
 
       } else {
@@ -266,8 +298,8 @@ namespace ctranslate2 {
         prompt_tokens.reserve(prompts.size());
         start_tokens.reserve(prompts.size());
         for (const auto& prompt : prompts) {
-          prompt_tokens.emplace_back(prompt.begin(), prompt.begin() + prompt_length - 1);
-          start_tokens.emplace_back(prompt.begin() + prompt_length - 1, prompt.end());
+          prompt_tokens.emplace_back(prompt.begin(), prompt.begin() + split);
+          start_tokens.emplace_back(prompt.begin() + split, prompt.end());
         }
 
         const Device device = _decoder->device();
@@ -291,8 +323,6 @@ namespace ctranslate2 {
         start_step = inputs.dim(1);
       }
 
-      const dim_t total_max_length = options.max_length;
-
       DecodingOptions decoding_options;
       decoding_options.start_step = start_step;
       decoding_options.beam_size = options.beam_size;
@@ -300,7 +330,10 @@ namespace ctranslate2 {
       decoding_options.length_penalty = options.length_penalty;
       decoding_options.repetition_penalty = options.repetition_penalty;
       decoding_options.no_repeat_ngram_size = options.no_repeat_ngram_size;
-      decoding_options.max_length = std::min(total_max_length / 2, total_max_length - start_step);
+      decoding_options.max_length = (fold_prefix
+                                     ? unfolded_max_length - prefix_length
+                                     : std::min(total_max_length / 2, total_max_length - start_step));
+      decoding_options.folded_prefix_length = fold_prefix ? prefix_length : 0;
       decoding_options.sampling_topk = options.sampling_topk;
       decoding_options.sampling_temperature = options.sampling_temperature;
       decoding_options.num_hypotheses = options.num_hypotheses;
@@ -355,6 +388,15 @@ namespace ctranslate2 {
 
       for (size_t i = 0; i < results.size(); ++i) {
         auto& result = results[i];
+
+        if (fold_prefix) {
+          // Keep the API contract: the returned hypotheses start with the text prefix,
+          // as they do when the prefix is decoded step by step.
+          const auto prefix_begin = prompts[i].begin() + prompt_length;
+          const auto prefix_end = prompts[i].end();
+          for (auto& hypothesis : result.hypotheses)
+            hypothesis.insert(hypothesis.begin(), prefix_begin, prefix_end);
+        }
 
         WhisperGenerationResult final_result;
         final_result.sequences = vocabulary.to_tokens(result.hypotheses);
