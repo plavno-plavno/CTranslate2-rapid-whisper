@@ -43,8 +43,6 @@ namespace ctranslate2 {
 
   bool mayiuse_bfloat16(const Device device, const int device_index = 0);
   bool mayiuse_float16(const Device device, const int device_index = 0);
-  bool mayiuse_int16(const Device device, const int device_index = 0);
-  bool mayiuse_int8(const Device device, const int device_index = 0);
 
   // Returns the final compute type based on model weights and device information.
   ComputeType resolve_compute_type(const ComputeType requested_compute_type,

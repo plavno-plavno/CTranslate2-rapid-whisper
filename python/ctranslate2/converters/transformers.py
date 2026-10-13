@@ -700,7 +700,7 @@ def main():
         args.model,
         activation_scales=args.activation_scales,
         copy_files=args.copy_files,
-        load_as_float16=args.quantization in ("float16", "int8_float16"),
+        load_as_float16=args.quantization == "float16",
         revision=args.revision,
         low_cpu_mem_usage=args.low_cpu_mem_usage,
         trust_remote_code=args.trust_remote_code,

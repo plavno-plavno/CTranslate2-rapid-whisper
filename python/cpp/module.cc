@@ -16,8 +16,6 @@ get_supported_compute_types(const std::string& device_str, const int device_inde
 
   const bool support_bfloat16 = ctranslate2::mayiuse_bfloat16(device, device_index);
   const bool support_float16 = ctranslate2::mayiuse_float16(device, device_index);
-  const bool support_int16 = ctranslate2::mayiuse_int16(device, device_index);
-  const bool support_int8 = ctranslate2::mayiuse_int8(device, device_index);
 
   std::unordered_set<std::string> compute_types;
   compute_types.emplace("float32");
@@ -27,19 +25,6 @@ get_supported_compute_types(const std::string& device_str, const int device_inde
 
   if (support_float16)
     compute_types.emplace("float16");
-
-  if (support_int16)
-    compute_types.emplace("int16");
-
-  if (support_int8) {
-    compute_types.emplace("int8");
-    compute_types.emplace("int8_float32");
-
-    if (support_float16)
-      compute_types.emplace("int8_float16");
-    if (support_bfloat16)
-      compute_types.emplace("int8_bfloat16");
-  }
 
   return compute_types;
 }

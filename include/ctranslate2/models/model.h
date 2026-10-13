@@ -74,15 +74,6 @@ namespace ctranslate2 {
         return _preferred_size_multiple;
       }
 
-      bool round_before_cast_in_quantization() const {
-        return _binary_version >= 5;
-      }
-
-
-      virtual bool use_global_int16_scale() const {
-        return true;
-      }
-
       ScopedDeviceSetter get_scoped_device_setter() const {
         return ScopedDeviceSetter(_device, _device_index);
       }
@@ -127,12 +118,6 @@ namespace ctranslate2 {
       // Returns true if the variable is quantizable and should respect compute_type.
       virtual bool is_quantizable(const std::string& variable_name) const;
 
-      // Returns true if the variable is the weight of a linear/dense layer.
-      virtual bool is_linear_weight(const std::string& variable_name) const;
-
-      // Returns true if the variable can be pre-packed.
-      virtual bool is_packable(const std::string& variable_name) const;
-
       // Returns true if the variable can be converted to another type.
       virtual bool is_convertible(const StorageView& variable, const std::string& name) const;
 
@@ -151,7 +136,6 @@ namespace ctranslate2 {
 
 
     private:
-      void process_linear_weights();
       void ensure_dtype(const std::string& name,
                         StorageView& variable,
                         const DataType target_dtype);

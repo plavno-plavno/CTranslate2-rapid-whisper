@@ -33,7 +33,6 @@ namespace ctranslate2 {
       const cudaDeviceProp& device_prop = cuda::get_device_properties(i);
       spdlog::info("GPU #{}: {} (CC={}.{})",
                    i, device_prop.name, device_prop.major, device_prop.minor);
-      spdlog::info(" - Allow INT8: {}", mayiuse_int8(Device::CUDA, i));
       spdlog::info(" - Allow FP16: {} (with Tensor Cores: {})",
                    mayiuse_float16(Device::CUDA, i),
                    cuda::gpu_has_fp16_tensor_cores(i));

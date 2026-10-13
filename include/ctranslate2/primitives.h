@@ -193,23 +193,6 @@ namespace ctranslate2 {
     template <typename T>
     static void swish(const T* x, T* y, dim_t size);
 
-    static void compute_u8_compensation(const int8_t* b,
-                                        bool transpose_b,
-                                        dim_t k,
-                                        dim_t n,
-                                        float alpha,
-                                        int32_t* compensation);
-
-    // If dest is not passed, returns the number of bytes required to store the packed data,
-    // or 0 if packing is not supported.
-    template <typename T>
-    static dim_t gemm_pack_b(const T* b,
-                             const bool transpose_b,
-                             const dim_t k,
-                             const dim_t n,
-                             const float alpha,
-                             T* dest = nullptr);
-
     template <typename In, typename Out>
     static void gemm(bool a_is_packed, bool b_is_packed,
                      bool transpose_a, bool transpose_b,

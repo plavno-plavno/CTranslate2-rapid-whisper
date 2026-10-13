@@ -45,10 +45,7 @@ namespace ctranslate2 {
                    StorageView& output,
                    const StorageView* qscale = nullptr) const;
 
-      void compute_with_gemm(const StorageView& input, const StorageView& weight, StorageView& output,
-                             const StorageView* qscale) const;
 
-      void im2col_transposed(const StorageView& input, StorageView& output, dim_t kernel_size) const;
     };
 
   }

@@ -116,8 +116,6 @@ set(SOURCES
   src/ops/conv1d.cc
   src/ops/conv1d_cpu.cc
   src/ops/cos.cc
-  src/ops/dequantize.cc
-  src/ops/dequantize_cpu.cc
   src/ops/gather.cc
   src/ops/gather_cpu.cc
   src/ops/gelu.cc
@@ -136,8 +134,6 @@ set(SOURCES
   src/ops/mul.cc
   src/ops/multinomial.cc
   src/ops/multinomial_cpu.cc
-  src/ops/quantize.cc
-  src/ops/quantize_cpu.cc
   src/ops/relu.cc
   src/ops/rms_norm.cc
   src/ops/rms_norm_cpu.cc
@@ -179,7 +175,6 @@ set(CUDA_SOURCES
   src/ops/bias_add_gpu.cu
   src/ops/concat_split_slide_gpu.cu
   src/ops/conv1d_gpu.cu
-  src/ops/dequantize_gpu.cu
   src/ops/gather_gpu.cu
   src/ops/gumbel_max_gpu.cu
   src/ops/layer_norm_gpu.cu
@@ -192,7 +187,6 @@ set(CUDA_SOURCES
   src/ops/tile_gpu.cu
   src/ops/topk_gpu.cu
   src/ops/topp_mask_gpu.cu
-  src/ops/quantize_gpu.cu
 )
 set(LIBRARIES
   ${CMAKE_THREAD_LIBS_INIT}

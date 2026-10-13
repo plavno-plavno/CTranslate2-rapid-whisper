@@ -12,7 +12,6 @@
 #  include "cuda/utils.h"
 #endif
 
-#include "cpu/backend.h"
 
 namespace ctranslate2 {
   namespace models {
@@ -264,14 +263,6 @@ namespace ctranslate2 {
       return ends_with(variable_name, "weight");
     }
 
-    bool Model::is_linear_weight(const std::string&) const {
-      return false;
-    }
-
-    bool Model::is_packable(const std::string& variable_name) const {
-      return is_linear_weight(variable_name);
-    }
-
     bool Model::is_convertible(const StorageView& variable, const std::string& name) const {
       return !variable.is_scalar() && name.find("_scale") == std::string::npos;
     }
@@ -279,68 +270,15 @@ namespace ctranslate2 {
     void Model::ensure_dtype(const std::string& name,
                              StorageView& variable,
                              const DataType target_dtype) {
-      const std::string scale_name = name + "_scale";
-      const StorageView* saved_scale = nullptr;
-      if (!is_float_type(variable.dtype())) {
-        // Check that the quantization scale of the variable exists.
-        saved_scale = get_variable_if_exists(scale_name);
-        if (!saved_scale) {
-          if (variable.dtype() == DataType::INT16) {
-            // Backward compatibility with int16 models without a saved scale.
-            register_variable(scale_name, StorageView(ops::Quantize::global_int16_scale));
-            saved_scale = get_variable_if_exists(scale_name);
-          } else {
-            throw std::runtime_error("variable " + scale_name + " not found");
-          }
-        }
-      }
-
-      if (variable.dtype() == target_dtype)
-        return;
-
-      // Use the same quantization logic as in model_spec.py.
-      const ops::Quantize quantize_op(/*int16_scale_type=*/ops::Quantize::ScaleType::PER_LAYER,
-                                      /*shift_to_uint8=*/false,
-                                      /*round_before_cast=*/round_before_cast_in_quantization());
-      const ops::Dequantize dequantize_op{};
-      StorageView target_variable(target_dtype);
-
-      if (is_float_type(target_dtype)) {
-        if (is_float_type(variable.dtype())) {
-          target_variable = variable.to(target_dtype);
-        } else {
-          // Dequantize int8 or int16 back to float.
-          StorageView dequantized;
-          dequantize_op(variable, *saved_scale, dequantized);
-          remove_variable(scale_name);  // The scale is no longer needed.
-          if (dequantized.dtype() == target_dtype) {
-            target_variable = std::move(dequantized);
-          } else {
-            target_variable = dequantized.to(target_dtype);
-          }
-        }
-
-      } else if (is_float_type(variable.dtype())) {
-        // Quantize float to int8 or int16.
-        StorageView scale;
-        if (variable.dtype() != DataType::FLOAT32) {
-          quantize_op(variable.to_float32(), target_variable, scale);
-        } else {
-          quantize_op(variable, target_variable, scale);
-        }
-        register_variable(scale_name, std::move(scale));
-
-      } else {
-        // Convert int8 -> float32 -> int16 or int16 -> float32 -> int8.
-        StorageView tmp_variable;
-        StorageView new_scale;
-        dequantize_op(variable, *saved_scale, tmp_variable);
-        quantize_op(tmp_variable, target_variable, new_scale);
-        remove_variable(scale_name);
-        register_variable(scale_name, std::move(new_scale));
-      }
-
-      variable = std::move(target_variable);
+      if (!is_float_type(variable.dtype()))
+        throw std::invalid_argument("Variable " + name + " is quantized ("
+                                    + dtype_name(variable.dtype()) + "): quantized models are "
+                                    "not supported by this build, convert the model with "
+                                    "--quantization float16");
+      if (!is_float_type(target_dtype))
+        throw std::invalid_argument("Quantized compute types are not supported by this build");
+      if (variable.dtype() != target_dtype)
+        variable = variable.to(target_dtype);
     }
 
     ComputeType Model::infer_compute_type() const {
@@ -358,45 +296,6 @@ namespace ctranslate2 {
       }
 
       return data_type_to_compute_type(weight_type, other_type);
-    }
-
-    // This method runs some precomputations on linear weights when possible.
-    void Model::process_linear_weights() {
-      if (_device != Device::CPU)
-        return;  // There is currently no processing for non CPU device.
-
-      const bool pack_weights = cpu::pack_gemm_weights(_effective_compute_type);
-      const bool transpose = true;
-      const float alpha = 1;
-
-      const auto variable_index = _variable_index;
-      for (const auto& pair : variable_index) {
-        const std::string& name = pair.first;
-        if (!is_linear_weight(name))
-          continue;
-
-        const StorageView& weight = *pair.second;
-        const DataType dtype = weight.dtype();
-        const dim_t k = weight.dim(1);
-        const dim_t n = weight.dim(0);
-
-        // If the target Gemm implementation prefers the u8s8s32 format, we can shift
-        // the input of linear layers to the u8 domain and add a compensation term.
-        // This term only depends on the linear weight, so we can compute it once and
-        // store it as a model variable.
-        if (dtype == DataType::INT8 && cpu::prefer_u8s8s32_gemm()) {
-          StorageView compensation = ops::Gemm::compensate_u8_input(weight, transpose, k, n, alpha);
-          register_variable(name + "_compensation", std::move(compensation));
-        }
-
-        // If requested, linear weights can be packed for the Gemm call.
-        // Only 2D weights are supported; Conv weights are 3D and use a different code path.
-        if (pack_weights && is_packable(name) && weight.rank() == 2) {
-          StorageView packed_weight = ops::Gemm::pack_b_input(weight, transpose, k, n, alpha);
-          register_variable(name + "_packed", std::move(packed_weight));
-          remove_variable(name);  // The original weight is no longer needed.
-        }
-      }
     }
 
     static DataType get_dtype_from_item_size(uint8_t item_size) {
@@ -563,7 +462,6 @@ namespace ctranslate2 {
 
       // Run additional model initialization.
       const ScopedDeviceSetter scoped_device_setter(device, device_index);
-      model->process_linear_weights();
       model->initialize(model_reader);
       return model;
     }

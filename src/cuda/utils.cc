@@ -182,16 +182,6 @@ namespace ctranslate2 {
     // See docs.nvidia.com/deeplearning/sdk/tensorrt-support-matrix/index.html
     // for hardware support of reduced precision.
 
-    bool gpu_supports_int8(int device) {
-      const cudaDeviceProp& device_prop = get_device_properties(device);
-      return device_prop.major > 6 || (device_prop.major == 6 && device_prop.minor == 1);
-    }
-
-    bool gpu_has_int8_tensor_cores(int device) {
-      const cudaDeviceProp& device_prop = get_device_properties(device);
-      return device_prop.major > 7 || (device_prop.major == 7 && device_prop.minor >= 2);
-    }
-
     bool gpu_has_fp16_tensor_cores(int device) {
       const cudaDeviceProp& device_prop = get_device_properties(device);
       return device_prop.major >= 7;

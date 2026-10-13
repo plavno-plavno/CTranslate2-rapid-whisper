@@ -61,7 +61,6 @@ namespace ctranslate2 {
       const ops::Gather _gather_op;
       const StorageView& _embeddings;
       const DataType _output_type;
-      const StorageView* _qscale;
     };
 
     // This enum order should remain fixed.
@@ -133,21 +132,12 @@ namespace ctranslate2 {
       void operator()(const StorageView& input, StorageView& output, const StorageView* residual = nullptr) const;
       void select_weights(const StorageView* index, const StorageView* extra_bias = nullptr);
     private:
-      bool _packed_weight;
       const StorageView& _weight;
       const StorageView* _bias;
-      const StorageView* _qscale;
-      const StorageView* _u8_shift_compensation;
       StorageView _partial_weight;
       StorageView _partial_bias;
-      StorageView _partial_qscale;
-      StorageView _partial_u8_shift_compensation;
       const DataType _output_type;
-      const bool _quantized_gemm;
       const ops::Gemm _gemm_op;
-      const ops::Quantize _quantize_op;
-      const ops::Dequantize _dequantize_op;
-      const ops::ActivationType* _activation_type;
     };
 
     class LayerNorm : public Layer

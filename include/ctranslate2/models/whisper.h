@@ -85,12 +85,7 @@ namespace ctranslate2 {
 
       size_t current_spec_revision() const override;
       bool is_quantizable(const std::string& variable_name) const override;
-      bool is_linear_weight(const std::string& variable_name) const override;
       std::unique_ptr<Model> clone() const override;
-
-      bool use_global_int16_scale() const override {
-        return false;
-      }
 
     protected:
       void initialize(ModelReader& model_reader) override;

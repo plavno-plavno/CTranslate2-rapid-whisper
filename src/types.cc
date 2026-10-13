@@ -6,7 +6,6 @@
 #  include "./cuda/utils.h"
 #endif
 
-#include "cpu/backend.h"
 #include "env.h"
 
 namespace ctranslate2 {
@@ -123,31 +122,6 @@ namespace ctranslate2 {
     }
   }
 
-  bool mayiuse_int16(const Device device, const int) {
-    switch (device) {
-    case Device::CPU:
-      return cpu::has_gemm_backend(ComputeType::INT16);
-    default:
-      return false;
-    }
-  }
-
-  bool mayiuse_int8(const Device device, const int device_index) {
-    switch (device) {
-    case Device::CUDA:
-#ifdef CT2_WITH_CUDA
-      return cuda::gpu_supports_int8(device_index);
-#else
-      (void)device_index;
-      return false;
-#endif
-    case Device::CPU:
-      return cpu::has_gemm_backend(ComputeType::INT8);
-    default:
-      return false;
-    }
-  }
-
   static inline void unsupported_compute_type(const std::string& name) {
     throw std::invalid_argument("Requested " + name + " compute type, but the target device "
                                 "or backend do not support efficient " + name + " computation.");
@@ -160,8 +134,6 @@ namespace ctranslate2 {
                                    const bool enable_fallback) {
     const bool support_bfloat16 = mayiuse_bfloat16(device, device_index);
     const bool support_float16 = mayiuse_float16(device, device_index);
-    const bool support_int16 = mayiuse_int16(device, device_index);
-    const bool support_int8 = mayiuse_int8(device, device_index);
 
     switch (requested_compute_type) {
 
@@ -185,99 +157,19 @@ namespace ctranslate2 {
       return ComputeType::FLOAT32;
     }
 
-    case ComputeType::INT16: {
-      if (support_int16)
-        return ComputeType::INT16;
-      if (!enable_fallback)
-        unsupported_compute_type("int16");
-      if (device == Device::CPU && support_int8)
-        return ComputeType::INT8_FLOAT32;
-      if (device == Device::CUDA && support_float16)
-        return ComputeType::FLOAT16;
-      return ComputeType::FLOAT32;
-    }
-
-    case ComputeType::INT8: {
-      const DataType float_type = compute_type_to_data_type(model_compute_type).second;
-      ComputeType actual_compute_type = ComputeType::INT8_FLOAT32;
-
-      switch (float_type) {
-      case DataType::FLOAT16:
-        actual_compute_type = ComputeType::INT8_FLOAT16;
-        break;
-      case DataType::BFLOAT16:
-        actual_compute_type = ComputeType::INT8_BFLOAT16;
-        break;
-      default:
-        actual_compute_type = ComputeType::INT8_FLOAT32;
-        break;
-      }
-
-      const ComputeType resolved_compute_type = resolve_compute_type(actual_compute_type,
-                                                                     model_compute_type,
-                                                                     device,
-                                                                     device_index,
-                                                                     /*enable_fallback=*/true);
-
-      const DataType weight_type = compute_type_to_data_type(resolved_compute_type).first;
-      if (weight_type != DataType::INT8)
-        unsupported_compute_type("int8");
-
-      return resolved_compute_type;
-    }
-
-    case ComputeType::INT8_FLOAT32: {
-      if (support_int8)
-        return ComputeType::INT8_FLOAT32;
-      if (!enable_fallback)
-        unsupported_compute_type("int8_float32");
-      if (device == Device::CPU && support_int16)
-        return ComputeType::INT16;
-      if (device == Device::CUDA && support_float16)
-        return ComputeType::FLOAT16;
-      return ComputeType::FLOAT32;
-    }
-
-    case ComputeType::INT8_FLOAT16: {
-      if (support_int8 && support_float16)
-        return ComputeType::INT8_FLOAT16;
-      if (!enable_fallback)
-        unsupported_compute_type("int8_float16");
-      if (support_int8)
-        return ComputeType::INT8_FLOAT32;
-      if (support_float16)
-        return ComputeType::FLOAT16;
-      if (support_int16)
-        return ComputeType::INT16;
-      return ComputeType::FLOAT32;
-    }
-
-    case ComputeType::INT8_BFLOAT16: {
-      if (support_int8 && support_bfloat16)
-        return ComputeType::INT8_BFLOAT16;
-      if (!enable_fallback)
-        unsupported_compute_type("int8_bfloat16");
-      if (support_int8)
-        return ComputeType::INT8_FLOAT32;
-      if (support_bfloat16)
-        return ComputeType::BFLOAT16;
-      return ComputeType::FLOAT32;
-    }
+    case ComputeType::INT8:
+    case ComputeType::INT8_FLOAT32:
+    case ComputeType::INT8_FLOAT16:
+    case ComputeType::INT8_BFLOAT16:
+    case ComputeType::INT16:
+      throw std::invalid_argument("Compute type " + compute_type_to_str(requested_compute_type)
+                                  + " is not supported by this build: quantized compute types "
+                                  "and quantized models were removed (use float16, bfloat16 or "
+                                  "float32)");
 
     case ComputeType::AUTO: {
-      if (device == Device::CUDA) {
-        if (support_int8 && support_float16)
-          return ComputeType::INT8_FLOAT16;
-        if (support_int8)
-          return ComputeType::INT8_FLOAT32;
-        if (support_float16)
-          return ComputeType::FLOAT16;
-      } else {
-        if (support_int8)
-          return ComputeType::INT8_FLOAT32;
-        if (support_int16)
-          return ComputeType::INT16;
-      }
+      if (support_float16)
+        return ComputeType::FLOAT16;
       return ComputeType::FLOAT32;
     }
 
@@ -350,9 +242,6 @@ namespace ctranslate2 {
       if ((compute_type == ComputeType::FLOAT16 || compute_type == ComputeType::BFLOAT16)
           && cuda::gpu_has_fp16_tensor_cores(device_index))
         return 8;
-      else if ((compute_type == ComputeType::INT8_FLOAT16 || compute_type == ComputeType::INT8_BFLOAT16 || compute_type == ComputeType::INT8_FLOAT32)
-          && cuda::gpu_has_int8_tensor_cores(device_index))
-        return 16;
     }
 #else
     (void)compute_type;

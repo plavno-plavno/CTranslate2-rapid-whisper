@@ -24,12 +24,8 @@ except ImportError:
 OPTIONAL = "__optional"
 CURRENT_BINARY_VERSION = 6
 
+# Quantized weight types (int8, int16) were removed with the quantized kernels.
 ACCEPTED_MODEL_TYPES = (
-    "int8",
-    "int8_float32",
-    "int8_float16",
-    "int8_bfloat16",
-    "int16",
     "float16",
     "bfloat16",
     "float32",
@@ -201,61 +197,13 @@ class LayerSpec(FrozenAttr, metaclass=FrozenMeta):
                 return
 
             key = _split_scope(name)[-1]
-            scale = None
             is_quantizable = hasattr(spec, "%s_scale" % key)
             is_convertible = value.dtype in ("float32", "float16", "bfloat16")
 
-            if is_quantizable:
-                if quantization == "int16":
-                    value = value.to("float32").numpy()
-                    # Represent the value with 10 bits so the multiplication is 20 bits
-                    # and 12 bits are left for accumulation.
-                    scale = np.float32(2**10 / np.amax(np.absolute(value)))
-                    value *= scale
-                    value = np.rint(value)
-                    value = np.clip(
-                        value, np.iinfo(np.int16).min, np.iinfo(np.int16).max
-                    )
-                    value = value.astype(np.int16)
-                    scale = NumpyVariable(scale)
-                    value = NumpyVariable(value)
-                elif quantization in (
-                    "int8",
-                    "int8_float32",
-                    "int8_float16",
-                    "int8_bfloat16",
-                ):
-                    value = value.to("float32").numpy()
-                    # For conv1d layer we need to reshape to 2D before calculating scale
-                    old_shape = None
-                    if len(value.shape) == 3:
-                        old_shape = value.shape
-                        value = value.reshape(value.shape[0], -1)
-                    amax = np.amax(np.absolute(value), axis=1)
-                    amax[amax == 0] = 127.0
-                    scale = 127.0 / amax
-                    value *= np.expand_dims(scale, 1)
-                    value = np.rint(value)
-                    value = value.astype(np.int8)
-                    # reshape back to old shape
-                    if old_shape:
-                        value = value.reshape(old_shape)
-                    scale = NumpyVariable(scale)
-                    value = NumpyVariable(value)
-                elif quantization in ("float16", "bfloat16", "float32"):
-                    value = value.to(quantization)
-
-            elif is_convertible:
-                if quantization in ("float16", "int8_float16"):
-                    value = value.to("float16")
-                elif quantization in ("bfloat16", "int8_bfloat16"):
-                    value = value.to("bfloat16")
-                elif quantization in ("float32", "int16", "int8_float32"):
-                    value = value.to("float32")
+            if (is_quantizable or is_convertible) and quantization is not None:
+                value = value.to(quantization)
 
             setattr(spec, key, value)
-            if scale is not None:
-                setattr(spec, "%s_scale" % key, scale)
 
         self._visit(_quantize)
 
@@ -266,8 +214,7 @@ class LayerSpec(FrozenAttr, metaclass=FrozenMeta):
         * Quantize weights.
 
         Arguments:
-          quantization: Weight quantization scheme (possible values are: int8, int8_float32,
-            int8_float16, int8_bfloat16, int16, float16, bfloat16, float32).
+          quantization: Weight type (possible values are: float16, bfloat16, float32).
         """
         self._alias_variables()
         self._quantize(quantization)

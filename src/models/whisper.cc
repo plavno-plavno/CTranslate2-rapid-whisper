@@ -38,10 +38,6 @@ namespace ctranslate2 {
       return Model::is_quantizable(variable_name);
     }
 
-    bool WhisperModel::is_linear_weight(const std::string& variable_name) const {
-      return is_quantizable(variable_name) && variable_name.find("embeddings") == std::string::npos;
-    }
-
     std::unique_ptr<Model> WhisperModel::clone() const {
       return std::make_unique<WhisperModel>(*this);
     }

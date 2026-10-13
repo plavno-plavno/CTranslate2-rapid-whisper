@@ -3,7 +3,6 @@
 #include <cmath>
 
 #include "ctranslate2/ops/activation.h"
-#include "cpu/backend.h"
 #include "dispatch.h"
 
 namespace ctranslate2 {
@@ -49,7 +48,6 @@ namespace ctranslate2 {
     Embeddings::Embeddings(const models::Model& model, const std::string& scope)
       : _embeddings(model.get_variable(scope + "/weight"))
       , _output_type(get_default_float_type(model.effective_compute_type()))
-      , _qscale(model.get_variable_if_exists(scope + "/weight_scale"))
     {
     }
 
@@ -64,20 +62,7 @@ namespace ctranslate2 {
     void Embeddings::operator()(const StorageView& ids,
                                 StorageView& output) const {
       PROFILE("Embeddings");
-      if (_embeddings.dtype() == DataType::INT16 || _embeddings.dtype() == DataType::INT8) {
-        const auto device = output.device();
-        StorageView gathered(_embeddings.dtype(), device);
-        _gather_op(_embeddings, ids, gathered);
-        if (_qscale->is_scalar())
-          ops::Dequantize()(gathered, *_qscale, output);
-        else {
-          StorageView scale(_qscale->dtype(), device);
-          _gather_op(*_qscale, ids, scale);
-          ops::Dequantize()(gathered, scale, output);
-        }
-      } else {
-        _gather_op(_embeddings, ids, output);
-      }
+      _gather_op(_embeddings, ids, output);
     }
 
 
@@ -251,50 +236,21 @@ namespace ctranslate2 {
     }
 
 
-    static const StorageView& get_linear_weight(const models::Model& model,
-                                                const std::string& scope,
-                                                bool* is_packed) {
-      const StorageView* weight = model.get_variable_if_exists(scope + "/weight_packed");
-      if (weight) {
-        *is_packed = true;
-        return *weight;
-      }
-      *is_packed = false;
-      return model.get_variable(scope + "/weight");
-    }
-
     Dense::Dense(const models::Model& model,
                  const std::string& scope,
                  const ops::ActivationType* activation_type)
-      : _packed_weight(false)
-      , _weight(get_linear_weight(model, scope, &_packed_weight))
+      : _weight(model.get_variable(scope + "/weight"))
       , _bias(model.get_variable_if_exists(scope + "/bias"))
-      , _qscale(model.get_variable_if_exists(scope + "/weight_scale"))
-      , _u8_shift_compensation((_weight.device() == Device::CPU
-                                && _weight.dtype() == DataType::INT8
-                                && cpu::prefer_u8s8s32_gemm())
-                               ? &model.get_variable(scope + "/weight_compensation")
-                               : nullptr)
       , _partial_weight(_weight.device(), _weight.dtype())
       , _partial_bias(_weight.device(), _bias ? _bias->dtype() : DataType::FLOAT32)
-      , _partial_qscale(_weight.device(), DataType::FLOAT32)
-      , _partial_u8_shift_compensation(_weight.device(), DataType::INT32)
       , _output_type(get_default_float_type(model.effective_compute_type()))
-      , _quantized_gemm(_weight.dtype() == DataType::INT16 || _weight.dtype() == DataType::INT8)
       , _gemm_op(/*alpha=*/1,
                  /*beta=*/0,
                  /*trans_a=*/false,
                  /*trans_b=*/true,
                  /*a_is_packed=*/false,
-                 _packed_weight,
-                 _quantized_gemm ? nullptr : activation_type)
-      , _quantize_op(model.use_global_int16_scale()
-                     ? ops::Quantize::ScaleType::GLOBAL
-                     : ops::Quantize::ScaleType::PER_LAYER,
-                     /*shift_to_uint8=*/bool(_u8_shift_compensation),
-                     /*round_before_cast=*/model.round_before_cast_in_quantization())
-      , _dequantize_op(activation_type)
-      , _activation_type(activation_type)
+                 /*b_is_packed=*/false,
+                 activation_type)
     {
     }
 
@@ -308,8 +264,6 @@ namespace ctranslate2 {
 
     void Dense::select_weights(const StorageView* index, const StorageView* extra_bias) {
       if (index) {
-        if (_packed_weight)
-          throw std::runtime_error("Can't select pre-packed weight");
         ops::Gather()(_weight, *index, _partial_weight);
 
         if (_bias) {
@@ -319,49 +273,17 @@ namespace ctranslate2 {
         } else if (extra_bias) {
           _partial_bias = *extra_bias;
         }
-
-        if (_u8_shift_compensation)
-          ops::Gather()(*_u8_shift_compensation, *index, _partial_u8_shift_compensation);
-        if (_qscale && !_qscale->is_scalar())
-          ops::Gather()(*_qscale, *index, _partial_qscale);
       } else {
         _partial_weight.clear();
         _partial_bias.clear();
-        _partial_qscale.clear();
-        _partial_u8_shift_compensation.clear();
       }
     }
 
     void Dense::operator()(const StorageView& input, StorageView& output, const StorageView* residual) const {
       PROFILE("Dense");
-      const StorageView* qscale = _partial_qscale.empty() ? _qscale : &_partial_qscale;
       const StorageView* weight = _partial_weight.empty() ? &_weight : &_partial_weight;
       const StorageView* bias = _partial_bias.empty() ? _bias : &_partial_bias;
-      const StorageView* compensation = (_partial_u8_shift_compensation.empty()
-                                         ? _u8_shift_compensation
-                                         : &_partial_u8_shift_compensation);
-
-      if (_quantized_gemm) {
-        const auto device = input.device();
-        StorageView qinput(_weight.dtype(), device);
-        StorageView qinput_scale(_qscale->dtype(), device);
-        StorageView qoutput(DataType::INT32, device);
-
-        _quantize_op(input, qinput, qinput_scale);
-
-        _gemm_op(qinput, *weight, qoutput, compensation);
-        _dequantize_op(qoutput,
-                       qinput_scale,
-                       *qscale,
-                       /*trans_a=*/false,
-                       /*trans_b=*/true,
-                       output,
-                       bias);
-        if (residual)
-          ops::Add()(*residual, output, output);
-      } else {
-        _gemm_op(input, *weight, output, nullptr, bias, residual);
-      }
+      _gemm_op(input, *weight, output, nullptr, bias, residual);
     }
 
 

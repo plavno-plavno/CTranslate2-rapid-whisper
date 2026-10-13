@@ -67,8 +67,7 @@ class Converter(abc.ABC):
           output_dir: Output directory where the CTranslate2 model is saved.
           vmap: Optional path to a vocabulary mapping file that will be included
             in the converted model directory.
-          quantization: Weight quantization scheme (possible values are: int8, int8_float32,
-            int8_float16, int8_bfloat16, int16, float16, bfloat16, float32).
+          quantization: Weight type (possible values are: float16, bfloat16, float32).
           force: Override the output directory if it already exists.
 
         Returns:
