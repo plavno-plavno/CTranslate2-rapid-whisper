@@ -546,7 +546,12 @@ if (WITH_CUDA)
     list(REMOVE_DUPLICATES CUDA_ARCH_LIST)
   endif()
 
-  cuda_select_nvcc_arch_flags(ARCH_FLAGS ${CUDA_ARCH_LIST})
+  if(CUDA_ARCH_FLAGS_OVERRIDE)
+    # FindCUDA in older CMake cannot parse two-digit major archs (e.g. 12.0 for Blackwell).
+    set(ARCH_FLAGS ${CUDA_ARCH_FLAGS_OVERRIDE})
+  else()
+    cuda_select_nvcc_arch_flags(ARCH_FLAGS ${CUDA_ARCH_LIST})
+  endif()
   list(APPEND CUDA_NVCC_FLAGS ${ARCH_FLAGS})
   set(CUDA_HOST_COMPILER ${CMAKE_CXX_COMPILER})
 
