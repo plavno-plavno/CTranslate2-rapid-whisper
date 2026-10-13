@@ -753,7 +753,8 @@ namespace ctranslate2 {
       static const dim_t max_queued = std::max<dim_t>(
         1, std::min<dim_t>(read_int_from_env("CT2_CUDA_GRAPHS_QUEUE", 2),
                            StepGraphs::num_result_slots));
-      if (!cuda_graphs_enabled() || _device != Device::CUDA
+      static const bool device_greedy = read_bool_from_env("CT2_CUDA_GRAPHS_DEVICE_GREEDY", true);
+      if (!cuda_graphs_enabled() || !device_greedy || _device != Device::CUDA
           || (_step_graphs && _step_graphs->disabled))
         return 0;
       return max_queued;
