@@ -18,17 +18,6 @@ namespace ctranslate2 {
     std::vector<std::vector<StorageView>> logits_vocab;
   };
 
-  struct DecodingStepResult {
-    size_t step;
-    size_t batch_id;
-    size_t token_id;
-    size_t hypothesis_id;
-    std::optional<float> score;
-    std::optional<StorageView> logits;
-    bool is_last = false;
-  };
-
-
   class SearchStrategy {
   public:
     virtual ~SearchStrategy() = default;
@@ -65,7 +54,6 @@ namespace ctranslate2 {
     BeamSearch(const dim_t beam_size,
                const float length_penalty = 0,
                const float coverage_penalty = 0,
-               const float prefix_bias_beta = 0,
                const float patience = 1);
 
     std::vector<DecodingResult>
@@ -90,35 +78,14 @@ namespace ctranslate2 {
     const dim_t _beam_size;
     const float _length_penalty;
     const float _coverage_penalty;
-    const float _prefix_bias_beta;
     const size_t _max_candidates;
   };
-
-  class BiasedDecoder {
-  public:
-    BiasedDecoder(const float prefix_bias_beta,
-                  const std::vector<std::vector<size_t>>& prefix_ids);
-
-    void
-    decode(const dim_t cur_batch_size,
-           const size_t step,
-           const std::vector<dim_t>& batch_offset,
-           const std::vector<std::vector<bool>>& beams_diverged_from_prefix,
-           const StorageView& logits,
-           StorageView& log_probs);
-  private:
-    StorageView _spare_beam;
-    const float _prefix_bias_beta;
-    std::vector<std::vector<size_t>> _prefix_ids;
-  };
-
 
   class GreedySearch : public SearchStrategy {
   public:
     // Penalties are only applied to return scores consistent with the beam search.
     GreedySearch(const float length_penalty = 0,
-                 const float coverage_penalty = 0,
-                 std::function<bool(DecodingStepResult)> callback = nullptr);
+                 const float coverage_penalty = 0);
 
     std::vector<DecodingResult>
     search(layers::Decoder& decoder,
@@ -141,7 +108,6 @@ namespace ctranslate2 {
   private:
     const float _length_penalty;
     const float _coverage_penalty;
-    const std::function<bool(DecodingStepResult)> _callback;
   };
 
 
@@ -152,7 +118,6 @@ namespace ctranslate2 {
     float coverage_penalty = 0;
     float repetition_penalty = 1;
     size_t no_repeat_ngram_size = 0;
-    float prefix_bias_beta = 0;
     dim_t start_step = 0;
     size_t max_length = 256;
     size_t min_length = 0;
@@ -164,14 +129,10 @@ namespace ctranslate2 {
     bool return_scores = false;
     bool return_attention = false;
     bool return_logits_vocab = false;
-    bool return_alternatives = false;
     bool return_prefix = true;
-    float min_alternative_expansion_prob = 0;
     std::vector<size_t> disable_ids;
     std::vector<size_t> disable_ids_begin;
-    std::vector<std::vector<size_t>> disable_sequences;
     std::vector<std::shared_ptr<LogitsProcessor>> logits_processors;
-    std::function<bool(DecodingStepResult)> callback = nullptr;
     // Number of hard prefix tokens the caller forwarded into the decoder state in one
     // pass instead of passing them in start_tokens. Decoding then behaves as if they had
     // been forced step by step: they count in the hypothesis length for score

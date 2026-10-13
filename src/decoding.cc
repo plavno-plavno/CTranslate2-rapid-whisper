@@ -254,105 +254,6 @@ namespace ctranslate2 {
     sort_hypotheses(result, max_hypotheses, keep_scores, keep_attention, keep_logits_vocab);
   }
 
-  BiasedDecoder::BiasedDecoder(const float prefix_bias_beta,
-                               const std::vector<std::vector<size_t>>& prefix_ids)
-    : _prefix_bias_beta(prefix_bias_beta)
-    , _prefix_ids(prefix_ids)
-  {
-  }
-
-  void BiasedDecoder::decode(const dim_t cur_batch_size,
-                             const size_t step,
-                             const std::vector<dim_t>& batch_offset,
-                             const std::vector<std::vector<bool>>& beams_diverged_from_prefix,
-                             const StorageView& logits,
-                             StorageView& log_probs) {
-    const dim_t num_beams = logits.dim(0);
-    const Device device = logits.device();
-    const DataType dtype = logits.dtype();
-
-    if (_spare_beam.dtype() != dtype || _spare_beam.device() != device) {
-      _spare_beam = StorageView(device, dtype);
-    }
-
-    std::vector<StorageView> logit_beam_view_storage(num_beams, StorageView(device, dtype));
-    std::vector<StorageView*> logit_beam_views(num_beams);
-    std::vector<StorageView> log_prob_beam_view_storage(num_beams, StorageView(device, dtype));
-    std::vector<StorageView*> log_prob_beam_views(num_beams);
-    for (dim_t i = 0; i < num_beams; ++i) {
-      logit_beam_views[i] = &(logit_beam_view_storage[i]);
-      log_prob_beam_views[i] = &(log_prob_beam_view_storage[i]);
-    }
-    ops::Split(0, /*no_copy=*/true)(logits, logit_beam_views);
-    log_probs.resize_as(logits);
-    log_probs.reshape(logits.shape());
-    ops::Split(0, /*no_copy=*/true)(log_probs, log_prob_beam_views);
-
-    // Scalar's need to be allocated on CPUs.
-    StorageView scalar_discount(1 - _prefix_bias_beta, Device::CPU);
-    assert (num_beams % cur_batch_size == 0);
-    const dim_t cur_beam_size = num_beams / cur_batch_size;
-    for (dim_t b = 0; b < num_beams; ++b) {
-      StorageView &logit_beam = *(logit_beam_views[b]);
-      StorageView &log_prob_beam = *(log_prob_beam_views[b]);
-      const dim_t index_batch = b / cur_beam_size;
-      const dim_t index_beam = b % cur_beam_size;
-      const auto& prefix = _prefix_ids[batch_offset[index_batch]];
-      if (static_cast<size_t>(step) < prefix.size()
-          && !beams_diverged_from_prefix[index_batch][index_beam]) {
-        ops::SoftMax()(logit_beam, log_prob_beam);
-        ops::Mul()(log_prob_beam,
-                   scalar_discount.to(log_prob_beam.dtype()),
-                   _spare_beam);
-        const size_t biased_word_id = prefix[step];
-        StorageView spare_scalar_view;
-        TYPE_DISPATCH(
-          _spare_beam.dtype(),
-          spare_scalar_view = StorageView({1}, _spare_beam.data<T>() + biased_word_id, device));
-        const StorageView spare_scalar_copy(spare_scalar_view);
-        StorageView beta_scalar;
-        TYPE_DISPATCH(
-          _spare_beam.dtype(),
-          // Scalar's need to be allocated on CPUs.
-          beta_scalar = StorageView(static_cast<T>(_prefix_bias_beta), Device::CPU));
-        ops::Add()(spare_scalar_copy, beta_scalar, spare_scalar_view);
-        ops::Log()(_spare_beam, log_prob_beam);
-      } else {
-        ops::LogSoftMax()(logit_beam, log_prob_beam);
-      }
-    }
-  }
-
-  static inline std::vector<std::vector<bool>>
-  get_beams_divergence_from_prefix(const std::vector<std::vector<bool>>& beams_diverged_from_prefix,
-                                   const size_t step,
-                                   const StorageView& sampled_ids,
-                                   const std::vector<std::vector<size_t>>& prefix_ids,
-                                   const std::vector<dim_t>& batch_offset) {
-    auto updated = beams_diverged_from_prefix;
-    for (dim_t i = 0; i < dim_t(updated.size()); ++i) {
-      for (dim_t k = 0; k < dim_t(updated[i].size()); ++k) {
-        const size_t word_id = sampled_ids.at<int32_t>({i, k});
-        const auto& prefix = prefix_ids[batch_offset[i]];
-        updated[i][k] = (step >= prefix.size()
-                         || beams_diverged_from_prefix[i][k]
-                         || word_id != prefix[step]);
-      }
-    }
-    return updated;
-  }
-
-  static inline bool
-  all_beams_diverged_from_prefix(const std::vector<std::vector<bool>>& beams_diverged_from_prefix) {
-    for (const auto& batch : beams_diverged_from_prefix) {
-      for (const bool beam_diverged : batch) {
-        if (!beam_diverged)
-          return false;
-      }
-    }
-    return true;
-  }
-
   static inline size_t get_max_candidates(const dim_t beam_size, const float patience) {
     return std::round(float(beam_size) * patience);
   }
@@ -412,12 +313,10 @@ namespace ctranslate2 {
   BeamSearch::BeamSearch(const dim_t beam_size,
                          const float length_penalty,
                          const float coverage_penalty,
-                         const float prefix_bias_beta,
                          const float patience)
     : _beam_size(beam_size)
     , _length_penalty(length_penalty)
     , _coverage_penalty(coverage_penalty)
-    , _prefix_bias_beta(prefix_bias_beta)
     , _max_candidates(get_max_candidates(beam_size, patience))
   {
   }
@@ -474,14 +373,7 @@ namespace ctranslate2 {
       TYPE_DISPATCH(dtype, initialize_beam_scores<T>(topk_scores, batch_size, _beam_size));
     }
 
-    std::unique_ptr<BiasedDecoder> biased_decoder;
-    std::vector<std::vector<bool>> beams_diverged_from_prefix;
-    bool bias_towards_prefix = prefix_ids && _prefix_bias_beta > 0;
-    if (bias_towards_prefix) {
-      biased_decoder = std::make_unique<BiasedDecoder>(_prefix_bias_beta, *prefix_ids);
-      beams_diverged_from_prefix.resize(batch_size, std::vector<bool>(_beam_size, false));
-    }
-    const bool use_hard_prefix = prefix_ids && !bias_towards_prefix;
+    const bool use_hard_prefix = prefix_ids != nullptr;
 
     StorageView logits(dtype, device);
     StorageView alive_seq(topk_ids.dtype());
@@ -535,17 +427,8 @@ namespace ctranslate2 {
       }
 
       StorageView log_probs(dtype, device);
-      if (bias_towards_prefix) {
-        biased_decoder->decode(cur_batch_size,
-                               step,
-                               batch_offset,
-                               beams_diverged_from_prefix,
-                               logits,
-                               log_probs);
-      } else {
-        ops::LogSoftMax()(logits);
-        log_probs.shallow_copy(logits);
-      }
+      ops::LogSoftMax()(logits);
+      log_probs.shallow_copy(logits);
 
       // Multiply by the current beam log probs.
       if (topk_scores) {
@@ -565,24 +448,16 @@ namespace ctranslate2 {
       // Unflatten the ids.
       StorageView gather_indices = unflatten_ids(topk_ids, _beam_size, vocabulary_size, is_expanded);
 
-      if (prefix_ids) {
-        if (use_hard_prefix) {
-          update_sample_with_prefix(step,
-                                    topk_ids,
-                                    topk_scores,
-                                    *prefix_ids,
-                                    end_ids,
-                                    batch_offset,
-                                    _beam_size,
-                                    &gather_indices,
-                                    is_expanded);
-        } else if (bias_towards_prefix) {
-          beams_diverged_from_prefix = get_beams_divergence_from_prefix(beams_diverged_from_prefix,
-                                                                        step,
-                                                                        topk_ids,
-                                                                        *prefix_ids,
-                                                                        batch_offset);
-        }
+      if (use_hard_prefix) {
+        update_sample_with_prefix(step,
+                                  topk_ids,
+                                  topk_scores,
+                                  *prefix_ids,
+                                  end_ids,
+                                  batch_offset,
+                                  _beam_size,
+                                  &gather_indices,
+                                  is_expanded);
       }
 
       // Append last prediction.
@@ -694,8 +569,6 @@ namespace ctranslate2 {
       if (next_batch_size != cur_batch_size) {
         batch_offset = index_vector(batch_offset, non_finished_index);
         top_beam_finished = index_vector(top_beam_finished, non_finished_index);
-        if (bias_towards_prefix)
-          beams_diverged_from_prefix = index_vector(beams_diverged_from_prefix, non_finished_index);
 
         keep_batches = std::make_unique<StorageView>(Shape{next_batch_size}, non_finished_index);
         gather(topk_ids, *keep_batches);
@@ -713,9 +586,6 @@ namespace ctranslate2 {
 
       topk_ids.reshape({next_batch_size * _beam_size});
       topk_scores.reshape({next_batch_size * _beam_size});
-
-      if (bias_towards_prefix)
-        bias_towards_prefix = !all_beams_diverged_from_prefix(beams_diverged_from_prefix);
     }
 
     return results;
@@ -723,11 +593,9 @@ namespace ctranslate2 {
 
 
   GreedySearch::GreedySearch(const float length_penalty,
-                             const float coverage_penalty,
-                             std::function<bool(DecodingStepResult)> callback)
+                             const float coverage_penalty)
     : _length_penalty(length_penalty)
     , _coverage_penalty(coverage_penalty)
-    , _callback(std::move(callback))
   {
   }
 
@@ -763,21 +631,7 @@ namespace ctranslate2 {
       if (prefix_ids)
         repeat_prefix_ids = repeat_vector(*prefix_ids, num_hypotheses);
 
-      std::unique_ptr<GreedySearch> greedy;
-
-      if (_callback) {
-        auto hypothesis_callback = [this, num_hypotheses](DecodingStepResult result) {
-          result.hypothesis_id = result.batch_id % num_hypotheses;
-          result.batch_id /= num_hypotheses;
-          return _callback(std::move(result));
-        };
-
-        greedy = std::make_unique<GreedySearch>(_length_penalty,
-                                                _coverage_penalty,
-                                                std::move(hypothesis_callback));
-      }
-
-      std::vector<DecodingResult> results = (greedy ? greedy.get() : this)->search(
+      std::vector<DecodingResult> results = search(
         decoder,
         state,
         sampler,
@@ -857,7 +711,6 @@ namespace ctranslate2 {
                              && dynamic_cast<const BestSampler*>(&sampler) != nullptr
                              && !gather_attention
                              && !return_logits_vocab
-                             && !_callback
                              && min_length == 0);
     if (use_device_steps && prefix_ids) {
       for (const auto& prefix : *prefix_ids)
@@ -1071,22 +924,6 @@ namespace ctranslate2 {
         bool is_finished = ((is_eos(word_id, end_ids) && step >= prefix_length)
                             || (is_last_step(step, max_length, prefix_length, return_prefix)));
 
-        if (_callback && (return_prefix || step >= prefix_length)) {
-          DecodingStepResult step_result;
-          step_result.step = step;
-          step_result.batch_id = batch_id;
-          step_result.token_id = word_id;
-          step_result.hypothesis_id = 0;
-          step_result.is_last = is_finished;
-          if (return_scores)
-            step_result.score = score;
-          if (return_logits_vocab)
-            step_result.logits = std::move(logits_orig);
-          if (_callback(std::move(step_result))) {
-            is_finished = true;
-          }
-        }
-
         if (is_finished) {
           finalize_result(results[batch_id],
                           1,
@@ -1123,29 +960,6 @@ namespace ctranslate2 {
     return results;
   }
 
-  static layers::DecoderState get_batch_state(const layers::DecoderState& state,
-                                              const int32_t batch_id) {
-    const Device device = state.begin()->second.device();
-    const ops::Gather gather_op;
-
-    StorageView indices(batch_id, device);
-    indices.reshape({1});
-
-    layers::DecoderState batch_state;
-    batch_state.reserve(state.size());
-
-    for (const auto& pair : state) {
-      const auto& name = pair.first;
-      const auto& value = pair.second;
-      StorageView batch_value(value.dtype(), device);
-      if (value)
-        gather_op(value, indices, batch_value);
-      batch_state.emplace(name, std::move(batch_value));
-    }
-
-    return batch_state;
-  }
-
   static std::pair<std::vector<size_t>, std::vector<std::vector<size_t>>>
   split_start_tokens(const std::vector<std::vector<size_t>>& start_tokens) {
     std::vector<size_t> start_ids;
@@ -1178,7 +992,6 @@ namespace ctranslate2 {
     if (options.num_hypotheses == 0)
       throw std::invalid_argument("The number of hypotheses must be > 0");
     if (options.num_hypotheses > get_max_candidates(options.beam_size, options.patience)
-        && !options.return_alternatives
         && !(options.beam_size == 1 && options.sampling_topk != 1))
       throw std::invalid_argument("The number of hypotheses cannot be greater than "
                                   "beam_size * patience");
@@ -1189,19 +1002,6 @@ namespace ctranslate2 {
       throw std::invalid_argument("The maximum decoding length must be > 0");
     if (options.repetition_penalty <= 0)
       throw std::invalid_argument("The repetition penalty must be > 0");
-    if (options.prefix_bias_beta >= 1)
-      throw std::invalid_argument("The beta value in biased decoding must be < 1");
-    if (options.prefix_bias_beta > 0 && options.return_alternatives)
-      throw std::invalid_argument("Biased decoding is not compatible with the return_alternatives "
-                                  "mode");
-    if (options.return_alternatives
-        && (options.min_alternative_expansion_prob < 0
-            || options.min_alternative_expansion_prob > 1))
-      throw std::invalid_argument("The minimum alternative expansion probability must be "
-                                  "between 0 and 1");
-    if (options.callback && (options.beam_size != 1 || options.prefix_bias_beta > 0))
-      throw std::invalid_argument("The callback function is not compatible with "
-                                  "beam_size > 1 or prefix_bias_beta > 0");
 
     if (options.sampling_topp <= 0 || options.sampling_topp > 1)
       throw std::invalid_argument("The sampling_topp parameter must be between 0 and 1");
@@ -1226,15 +1026,13 @@ namespace ctranslate2 {
   static std::unique_ptr<const SearchStrategy>
   make_search_strategy(const DecodingOptions& options) {
     std::unique_ptr<SearchStrategy> strategy;
-    if (options.beam_size == 1 && options.prefix_bias_beta == 0)
+    if (options.beam_size == 1)
       strategy = std::make_unique<GreedySearch>(options.length_penalty,
-                                                options.coverage_penalty,
-                                                options.callback);
+                                                options.coverage_penalty);
     else
       strategy = std::make_unique<BeamSearch>(options.beam_size,
                                               options.length_penalty,
                                               options.coverage_penalty,
-                                              options.prefix_bias_beta,
                                               options.patience);
     strategy->set_hypothesis_length_offset(options.folded_prefix_length);
     return strategy;
@@ -1261,8 +1059,6 @@ namespace ctranslate2 {
     if (!options.disable_ids_begin.empty())
       processors.emplace_back(std::make_shared<SuppressTokensBegin>(options.disable_ids_begin));
 
-    if (!options.disable_sequences.empty())
-      processors.emplace_back(std::make_shared<SuppressSequences>(options.disable_sequences));
 
     for (const auto& processor : options.logits_processors) {
       if (!processor->apply_first())
@@ -1270,179 +1066,6 @@ namespace ctranslate2 {
     }
 
     return processors;
-  }
-
-  static DecodingResult
-  decode_alternatives(layers::Decoder& decoder,
-                      layers::DecoderState& state,
-                      std::vector<size_t> start_tokens,
-                      const std::vector<size_t>& end_ids,
-                      const DecodingOptions& options) {
-    DecodingResult result;
-    result.hypotheses.resize(options.num_hypotheses);
-    if (options.return_scores)
-      result.scores.resize(options.num_hypotheses, 0);
-    if (options.return_attention)
-      result.attention.resize(options.num_hypotheses);
-    if (options.return_logits_vocab)
-      result.logits_vocab.resize(options.num_hypotheses);
-
-    if (start_tokens.empty())
-      throw std::invalid_argument("One input has no decoder start token");
-    if (start_tokens.size() > options.max_length + 1)
-      start_tokens.resize(options.max_length + 1);
-
-    const dim_t min_length = options.min_length;
-    const dim_t max_length = options.max_length;
-    const dim_t prefix_length = start_tokens.size() - 1;
-    dim_t start_step = options.start_step;
-
-    if (prefix_length > 0) {
-      // Initialize the decoder state with the prefix.
-      const Device device = decoder.device();
-      StorageView attention(decoder.output_type(), device);
-      StorageView input_ids({1, prefix_length},
-                            std::vector<int32_t>(start_tokens.begin(),
-                                                 start_tokens.begin() + prefix_length),
-                            device);
-
-      convert_to_original_word_ids(decoder, input_ids);
-      decoder(start_step,
-              input_ids,
-              state,
-              /*logits=*/nullptr,
-              options.return_attention ? &attention : nullptr);
-
-      for (size_t i = 0; i < options.num_hypotheses; ++i) {
-        result.hypotheses[i] = std::vector<size_t>(start_tokens.begin() + 1, start_tokens.end());
-
-        if (options.return_attention) {
-          if (attention.device() != Device::CPU)
-            attention = attention.to_float32().to(Device::CPU);
-          for (dim_t t = 0; t < prefix_length; ++t) {
-            const float* vector = attention.index<float>({0, t, 0});
-            result.attention[i].emplace_back(vector, vector + attention.dim(-1));
-          }
-        }
-      }
-
-      if (prefix_length == max_length)
-        return result;
-
-      start_step += prefix_length;
-    }
-
-    std::vector<size_t> start_ids{start_tokens.back()};
-
-    const auto logits_processors = make_logits_processors(options);
-
-    // Expand the next "num_hypotheses" candidate words using the beam search.
-    BeamSearch beam(options.num_hypotheses);
-    DecodingResult expansion_result = beam.search(decoder,
-                                                  state,
-                                                  BestSampler(),
-                                                  start_ids,
-                                                  end_ids,
-                                                  start_step,
-                                                  /*max_length=*/1,
-                                                  /*min_length=*/1,
-                                                  /*return_scores=*/true,
-                                                  options.return_attention,
-                                                  options.return_logits_vocab,
-                                                  options.return_prefix,
-                                                  options.num_hypotheses,
-                                                  options.include_eos_in_hypotheses,
-                                                  logits_processors)[0];
-
-    start_ids.clear();
-
-    for (size_t i = 0; i < options.num_hypotheses; ++i) {
-      const float prob = std::exp(expansion_result.scores[i]);
-      if (prob < options.min_alternative_expansion_prob)
-        break;
-
-      // Add expanded word to the result.
-      result.hypotheses[i].emplace_back(expansion_result.hypotheses[i].back());
-      if (options.return_attention)
-        result.attention[i].emplace_back(std::move(expansion_result.attention[i].back()));
-      if (options.return_scores)
-        result.scores[i] = expansion_result.scores[i];
-      if (options.return_logits_vocab)
-        result.logits_vocab[i].emplace_back(std::move(expansion_result.logits_vocab[i].back()));
-
-      // The next input is the words we just expanded.
-      start_ids.push_back(result.hypotheses[i].back());
-    }
-
-    const size_t num_alternatives = start_ids.size();
-
-    for (auto& [name, value] : state) {
-      if (decoder.replicate_state(name)) {
-        // Reduce state to the effective number of alternatives.
-        if (num_alternatives < options.num_hypotheses)
-          value.resize(0, num_alternatives);
-      } else {
-        // The beam dimension becomes the batch so we need to replicate all states.
-        repeat_batch(value, num_alternatives);
-      }
-    }
-
-    if (num_alternatives < options.num_hypotheses) {
-      result.hypotheses.resize(num_alternatives);
-      if (options.return_scores)
-        result.scores.resize(num_alternatives);
-      if (options.return_attention)
-        result.attention.resize(num_alternatives);
-    }
-
-    start_step += 1;
-    if (start_step == max_length)
-      return result;
-
-    // Continue the decoding from each alternative words independently.
-    const auto search_strategy = make_search_strategy(options);
-    const auto sampler = make_sampler(options);
-    auto suffix_results = search_strategy->search(decoder,
-                                                  state,
-                                                  *sampler,
-                                                  start_ids,
-                                                  end_ids,
-                                                  start_step,
-                                                  std::max(max_length - start_step, dim_t(0)),
-                                                  std::max(min_length - start_step, dim_t(0)),
-                                                  options.return_scores,
-                                                  options.return_attention,
-                                                  options.return_logits_vocab,
-                                                  options.return_prefix,
-                                                  /*num_hypotheses=*/1,
-                                                  options.include_eos_in_hypotheses,
-                                                  logits_processors);
-
-    // Update the result with the suffix decoding.
-    for (size_t i = 0; i < suffix_results.size(); ++i) {
-      auto& suffix = suffix_results[i];
-
-      if (options.return_scores) {
-        result.scores[i] += suffix.scores[0];
-      }
-
-      if (options.return_logits_vocab) {
-        result.logits_vocab[i].insert(result.logits_vocab[i].end(),
-                                   std::make_move_iterator(suffix.logits_vocab[0].begin()),
-                                   std::make_move_iterator(suffix.logits_vocab[0].end()));
-      }
-
-      if (options.return_attention)
-        result.attention[i].insert(result.attention[i].end(),
-                                   std::make_move_iterator(suffix.attention[0].begin()),
-                                   std::make_move_iterator(suffix.attention[0].end()));
-
-      result.hypotheses[i].insert(result.hypotheses[i].end(),
-                                  std::make_move_iterator(suffix.hypotheses[0].begin()),
-                                  std::make_move_iterator(suffix.hypotheses[0].end()));
-    }
-
-    return result;
   }
 
   static std::vector<size_t> map_to_output_word_ids(const layers::Decoder& decoder,
@@ -1475,53 +1098,38 @@ namespace ctranslate2 {
 
       for (auto& ids : start_tokens)
         ids = map_to_output_word_ids(decoder, ids);
-      for (auto& ids : options.disable_sequences)
-        ids = map_to_output_word_ids(decoder, ids);
 
       options.disable_ids = map_to_output_word_ids(decoder, options.disable_ids);
       options.disable_ids_begin = map_to_output_word_ids(decoder, options.disable_ids_begin);
     }
 
-    if (options.return_alternatives) {
-      results.reserve(batch_size);
-      for (size_t i = 0; i < batch_size; ++i) {
-        layers::DecoderState batch_state = get_batch_state(state, i);
-        results.emplace_back(decode_alternatives(decoder,
-                                                 batch_state,
-                                                 start_tokens[i],
-                                                 end_ids,
-                                                 options));
-      }
+    std::vector<size_t> start_ids;
+    std::vector<std::vector<size_t>> prefix_ids;
+    std::tie(start_ids, prefix_ids) = split_start_tokens(start_tokens);
+    // A folded prefix ended right before the start token: keep the search in prefix
+    // mode (empty prefixes) so the first free step is treated as after a forced prefix.
+    if (options.folded_prefix_length > 0 && prefix_ids.empty())
+      prefix_ids.assign(batch_size, {});
 
-    } else {
-      std::vector<size_t> start_ids;
-      std::vector<std::vector<size_t>> prefix_ids;
-      std::tie(start_ids, prefix_ids) = split_start_tokens(start_tokens);
-      // A folded prefix ended right before the start token: keep the search in prefix
-      // mode (empty prefixes) so the first free step is treated as after a forced prefix.
-      if (options.folded_prefix_length > 0 && prefix_ids.empty())
-        prefix_ids.assign(batch_size, {});
-
-      const auto search_strategy = make_search_strategy(options);
-      const auto sampler = make_sampler(options);
-      const auto logits_processors = make_logits_processors(options);
-      results = search_strategy->search(decoder,
-                                        state,
-                                        *sampler,
-                                        start_ids,
-                                        end_ids,
-                                        options.start_step,
-                                        options.max_length,
-                                        options.min_length,
-                                        options.return_scores,
-                                        options.return_attention,
-                                        options.return_logits_vocab,
-                                        options.return_prefix,
-                                        options.num_hypotheses,
-                                        options.include_eos_in_hypotheses,
-                                        logits_processors,
-                                        prefix_ids.empty() ? nullptr : &prefix_ids);
-    }
+    const auto search_strategy = make_search_strategy(options);
+    const auto sampler = make_sampler(options);
+    const auto logits_processors = make_logits_processors(options);
+    results = search_strategy->search(decoder,
+                                      state,
+                                      *sampler,
+                                      start_ids,
+                                      end_ids,
+                                      options.start_step,
+                                      options.max_length,
+                                      options.min_length,
+                                      options.return_scores,
+                                      options.return_attention,
+                                      options.return_logits_vocab,
+                                      options.return_prefix,
+                                      options.num_hypotheses,
+                                      options.include_eos_in_hypotheses,
+                                      logits_processors,
+                                      prefix_ids.empty() ? nullptr : &prefix_ids);
 
     if (decoder.output_layer_is_updated()) {
       // Restore original word ids.

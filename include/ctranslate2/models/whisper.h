@@ -1,6 +1,7 @@
 #pragma once
 
-#include "ctranslate2/generation.h"
+#include "ctranslate2/decoding.h"
+#include "ctranslate2/vocabulary.h"
 #include "ctranslate2/layers/whisper.h"
 #include "ctranslate2/models/model.h"
 #include "ctranslate2/replica_pool.h"
