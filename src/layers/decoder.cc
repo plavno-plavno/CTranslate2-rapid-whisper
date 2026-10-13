@@ -93,6 +93,7 @@ namespace ctranslate2 {
         // Reset the output layer if the output size is the vocabulary size.
         if (new_output_size == _vocabulary_size && padding_size == 0) {
           output_layer().select_weights(nullptr);
+          ++_output_layer_version;
           _to_output_word_id.clear();
           _to_original_word_id.clear();
           return;
@@ -131,6 +132,7 @@ namespace ctranslate2 {
         index = index.to(_device);
 
       output_layer().select_weights(&index, extra_bias.get());
+      ++_output_layer_version;
 
       _to_original_word_id = std::move(ids);
       _to_output_word_id.reserve(_to_original_word_id.size());

@@ -51,6 +51,11 @@ namespace ctranslate2 {
       // Returns true if the state must be replicated beam_size times.
       virtual bool replicate_state(const std::string& name) const;
 
+      // Incremented each time update_output_layer replaces the output weights.
+      dim_t output_layer_version() const {
+        return _output_layer_version;
+      }
+
       // Restrict the output layer to a set of ids and/or resize it to a preferred size multiple.
       // Elements in restrict_ids must be unique and sorted.
       void update_output_layer(const dim_t size_multiple = 1,
@@ -84,6 +89,50 @@ namespace ctranslate2 {
         return const_cast<Decoder&>(*this).output_layer().output_size();
       }
 
+      // Greedy decoding step that stays on the device: forwards `step`, applies the
+      // token suppression, the optional log softmax and the argmax exactly as the greedy
+      // search does, and feeds the selected ids to the next step without a host round
+      // trip. Steps can be queued back to back and their results read in one go.
+      struct GreedyStepOptions {
+        std::vector<size_t> disable_ids;        // Output vocabulary ids, every step.
+        std::vector<size_t> disable_ids_begin;  // Output vocabulary ids, begin step only.
+        float disable_value = 0;
+        bool log_softmax = false;
+
+        bool operator==(const GreedyStepOptions& other) const {
+          return disable_ids == other.disable_ids
+            && disable_ids_begin == other.disable_ids_begin
+            && disable_value == other.disable_value
+            && log_softmax == other.log_softmax;
+        }
+      };
+
+      // Number of greedy steps that may be queued before reading their results
+      // (0 when device greedy steps are not supported).
+      virtual dim_t max_queued_greedy_steps() const {
+        return 0;
+      }
+
+      // Queues one step. `input_ids` (original vocabulary ids, one per batch) must be set
+      // for the first step and after the batch changed; otherwise the step consumes the
+      // ids selected by the previous queued step. Returns false when the step cannot run
+      // on the device: nothing was queued and the caller must decode it regularly.
+      virtual bool queue_greedy_step(dim_t,
+                                     const GreedyStepOptions&,
+                                     const std::vector<int32_t>*,
+                                     bool,
+                                     DecoderState&) {
+        return false;
+      }
+
+      // Waits for the queued steps and returns their selected output ids and scores,
+      // step-major ([num_steps][batch_size]).
+      virtual void read_greedy_steps(dim_t,
+                                     dim_t,
+                                     std::vector<int32_t>&,
+                                     std::vector<float>&) {
+      }
+
     protected:
       // Returns the current batch size from the decoder state.
       virtual dim_t batch_size(const DecoderState& state) const;
@@ -96,6 +145,7 @@ namespace ctranslate2 {
       std::vector<size_t> _to_original_word_id;
       std::unordered_map<size_t, size_t> _to_output_word_id;
       dim_t _vocabulary_size = 0;
+      dim_t _output_layer_version = 0;
     };
 
 

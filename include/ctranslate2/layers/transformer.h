@@ -236,6 +236,46 @@ namespace ctranslate2 {
       // false when each layer has its own relative attention bias (e.g. UMT5), in which
       // case the position bias is computed per layer instead of being shared.
       const bool _shared_position_bias;
+
+    private:
+      // CUDA graphs of single decoding steps (CT2_CUDA_GRAPHS=1), see run_step_graph.
+      struct StepGraphs;
+      std::unique_ptr<StepGraphs> _step_graphs;
+      // Set while a step is captured: per-layer persistent self-attention cache buffers.
+      std::vector<SelfAttentionCacheTarget>* _capture_cache_targets = nullptr;
+
+      // Runs `step` as a CUDA graph. Regular step: `ids` given, the logits are copied to
+      // `logits`. Greedy step (`greedy` set): `ids` may be null to consume the ids
+      // selected by the previous greedy step, and the selection stays on the device.
+      bool run_step_graph(dim_t step,
+                          const StorageView* ids,
+                          DecoderState& state,
+                          StorageView* logits,
+                          const GreedyStepOptions* greedy,
+                          bool begin_step);
+
+      void select_greedy_on_device(StorageView& logits,
+                                   const GreedyStepOptions& options,
+                                   const StorageView& disable_indices,
+                                   const StorageView& id_table,
+                                   StorageView& result_ids,
+                                   StorageView& result_scores,
+                                   dim_t result_offset,
+                                   StorageView& next_ids) const;
+
+    public:
+      ~TransformerDecoder();
+
+      dim_t max_queued_greedy_steps() const override;
+      bool queue_greedy_step(dim_t step,
+                             const GreedyStepOptions& options,
+                             const std::vector<int32_t>* input_ids,
+                             bool begin_step,
+                             DecoderState& state) override;
+      void read_greedy_steps(dim_t first_step,
+                             dim_t num_steps,
+                             std::vector<int32_t>& ids,
+                             std::vector<float>& scores) override;
     };
 
   }

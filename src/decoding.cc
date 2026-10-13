@@ -842,8 +842,155 @@ namespace ctranslate2 {
     StorageView attention_step_device(dtype, device);
 
     const dim_t max_step = get_max_step(max_length, return_prefix, prefix_ids);
+    dim_t first_step = 0;
 
-    for (dim_t step = 0; step < max_step; ++step) {
+    // Device fast path (CUDA graphs): the token selection runs on the device, inside the
+    // graph of the decoder step, and for a single sequence several steps are queued
+    // before their results are read. Only for configurations where the selection is the
+    // exact device equivalent of the loop below: argmax sampling, token suppression as
+    // the only logits processing, no prefix to force, no per-step outputs. The results
+    // are processed by the same code as below, step by step; steps queued past the end
+    // of the sequence are discarded.
+    layers::Decoder::GreedyStepOptions device_options;
+    const dim_t max_queued = decoder.max_queued_greedy_steps();
+    bool use_device_steps = (max_queued > 0
+                             && dynamic_cast<const BestSampler*>(&sampler) != nullptr
+                             && !gather_attention
+                             && !return_logits_vocab
+                             && !_callback
+                             && min_length == 0);
+    if (use_device_steps && prefix_ids) {
+      for (const auto& prefix : *prefix_ids)
+        use_device_steps = use_device_steps && prefix.empty();
+    }
+    for (const auto& processor : logits_processors) {
+      if (!use_device_steps)
+        break;
+      if (const auto* suppress = dynamic_cast<const SuppressTokens*>(processor.get())) {
+        device_options.disable_ids.insert(device_options.disable_ids.end(),
+                                          suppress->ids().begin(),
+                                          suppress->ids().end());
+      } else if (const auto* suppress_begin =
+                 dynamic_cast<const SuppressTokensBegin*>(processor.get())) {
+        device_options.disable_ids_begin.insert(device_options.disable_ids_begin.end(),
+                                                suppress_begin->ids().begin(),
+                                                suppress_begin->ids().end());
+      } else {
+        use_device_steps = false;
+      }
+    }
+
+    if (use_device_steps) {
+      device_options.disable_value = std::numeric_limits<float>::lowest();  // DisableTokens.
+      device_options.log_softmax = return_scores;
+
+      std::vector<int32_t> input_ids;
+      std::vector<int32_t> step_ids;
+      std::vector<float> step_scores;
+      bool feed_ids = true;
+
+      while (first_step < max_step) {
+        const dim_t cur_batch_size = batch_offset.size();
+        const dim_t num_steps = (cur_batch_size == 1
+                                 ? std::min(max_queued, max_step - first_step)
+                                 : 1);
+        if (feed_ids) {
+          input_ids.resize(cur_batch_size);
+          for (dim_t i = 0; i < cur_batch_size; ++i)
+            input_ids[i] = decoder.to_original_word_id(sample_from.at<int32_t>(i));
+        }
+
+        dim_t queued = 0;
+        for (; queued < num_steps; ++queued) {
+          // SuppressTokensBegin applies at the first step (no prefix).
+          const dim_t step = first_step + queued;
+          if (!decoder.queue_greedy_step(start_step + step,
+                                         device_options,
+                                         queued == 0 && feed_ids ? &input_ids : nullptr,
+                                         /*begin_step=*/step == 0,
+                                         state))
+            break;
+        }
+        if (queued == 0)
+          break;  // Continue with the regular loop.
+        feed_ids = false;
+        decoder.read_greedy_steps(start_step + first_step, queued, step_ids, step_scores);
+
+        bool batch_changed = false;
+        for (dim_t k = 0; k < queued && !batch_changed; ++k) {
+          const dim_t step = first_step;
+          StorageView best_ids({cur_batch_size, 1}, DataType::INT32);
+          for (dim_t i = 0; i < cur_batch_size; ++i)
+            best_ids.at<int32_t>(i) = step_ids[k * cur_batch_size + i];
+
+          if (!logits_processors.empty()) {
+            if (alive_seq) {
+              const StorageView cur_alive_seq = std::move(alive_seq);
+              ops::Concat(-1)({&cur_alive_seq, &best_ids}, alive_seq);
+            } else {
+              alive_seq = best_ids;
+            }
+          }
+
+          std::vector<int32_t> non_finished_index;
+          non_finished_index.reserve(cur_batch_size);
+
+          for (dim_t i = 0; i < cur_batch_size; ++i) {
+            const size_t word_id = best_ids.at<int32_t>(i);
+            const size_t batch_id = batch_offset[i];
+            const dim_t prefix_length = prefix_ids ? prefix_ids->at(batch_id).size() : 0;
+            const float score = step_scores[k * cur_batch_size + i];
+
+            if ((!is_eos(word_id, end_ids) || include_eos_in_hypotheses)
+                && (return_prefix || step >= prefix_length)) {
+              results[batch_id].hypotheses[0].push_back(word_id);
+            }
+
+            if (return_scores)
+              results[batch_id].scores[0] += score;
+
+            const bool is_finished = ((is_eos(word_id, end_ids) && step >= prefix_length)
+                                      || (is_last_step(step, max_length, prefix_length, return_prefix)));
+
+            if (is_finished) {
+              finalize_result(results[batch_id],
+                              1,
+                              _length_penalty,
+                              _coverage_penalty,
+                              return_scores,
+                              return_attention,
+                              return_logits_vocab,
+                              _hypothesis_length_offset);
+            } else {
+              non_finished_index.emplace_back(i);
+              sample_from.at<int32_t>(i) = word_id;
+            }
+          }
+
+          ++first_step;
+          const dim_t count_alive = non_finished_index.size();
+
+          // No more sentences are alive, stop here.
+          if (count_alive == 0)
+            return results;
+
+          // Remove finished sentences from the execution.
+          if (count_alive != cur_batch_size) {
+            batch_offset = index_vector(batch_offset, non_finished_index);
+
+            StorageView alive({count_alive}, non_finished_index);
+            if (alive_seq)
+              gather(alive_seq, alive);
+            gather(sample_from, alive);
+            decoder.update_state(state, alive.to(device));
+            batch_changed = true;
+            feed_ids = true;
+          }
+        }
+      }
+    }
+
+    for (dim_t step = first_step; step < max_step; ++step) {
       convert_to_original_word_ids(decoder, sample_from);
       decoder(start_step + step,
               sample_from.to(device),

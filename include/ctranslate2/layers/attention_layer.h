@@ -5,6 +5,17 @@
 
 namespace ctranslate2 {
   namespace layers {
+
+    // While a decoder step is captured into a CUDA graph, the self-attention of the
+    // current layer concatenates its cache into these persistent buffers instead of a
+    // fresh allocation, so that the graph replays against stable addresses. The layout
+    // and the copy are the same as the regular concatenation. Thread-local, null when
+    // no capture is in progress.
+    struct SelfAttentionCacheTarget {
+      StorageView* keys;
+      StorageView* values;
+    };
+    SelfAttentionCacheTarget*& self_attention_cache_target();
     StorageView make_relative_positions(dim_t queries_length,
                                         dim_t keys_length,
                                         dim_t max_position);

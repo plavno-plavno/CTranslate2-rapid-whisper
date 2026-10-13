@@ -13,6 +13,11 @@
 namespace ctranslate2 {
   namespace layers {
 
+    SelfAttentionCacheTarget*& self_attention_cache_target() {
+      static thread_local SelfAttentionCacheTarget* target = nullptr;
+      return target;
+    }
+
     StorageView make_relative_positions(dim_t queries_length,
                                         dim_t keys_length,
                                         dim_t max_position) {
@@ -534,9 +539,16 @@ namespace ctranslate2 {
         }
 
         if (cached_keys != nullptr) {
+          SelfAttentionCacheTarget* target = self_attention_cache_target();
           if (cached_keys->empty()) {
             *cached_keys = std::move(keys_proj);
             *cached_values = std::move(values_proj);
+          } else if (target && _sliding_window == 0) {
+            const ops::Concat concat_op(_cache_time_dim);
+            concat_op({cached_keys, &keys_proj}, *target->keys);
+            concat_op({cached_values, &values_proj}, *target->values);
+            cached_keys->shallow_copy(*target->keys);
+            cached_values->shallow_copy(*target->values);
           } else {
             const ops::Concat concat_op(_cache_time_dim);
             StorageView& tmp = fused_proj;  // Reuse storage.

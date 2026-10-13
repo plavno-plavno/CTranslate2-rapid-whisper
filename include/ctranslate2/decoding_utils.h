@@ -159,6 +159,10 @@ namespace ctranslate2 {
                const std::vector<dim_t>& batch_offset,
                const std::vector<std::vector<size_t>>* prefix) override;
 
+    const std::vector<size_t>& ids() const {
+      return _ids;
+    }
+
   private:
     const std::vector<size_t> _ids;
   };
@@ -173,6 +177,10 @@ namespace ctranslate2 {
                const StorageView& sequences,
                const std::vector<dim_t>& batch_offset,
                const std::vector<std::vector<size_t>>* prefix) override;
+
+    const std::vector<size_t>& ids() const {
+      return _ids;
+    }
 
   private:
     const std::vector<size_t> _ids;
