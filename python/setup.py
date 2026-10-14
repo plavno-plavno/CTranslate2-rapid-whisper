@@ -81,7 +81,7 @@ setup(
     url="https://github.com/plavno-plavno/CTranslate2-rapid-whisper",
     classifiers=[
         "Development Status :: 5 - Production/Stable",
-        "Environment :: GPU :: NVIDIA CUDA :: 12 :: 12.8",
+        "Environment :: GPU :: NVIDIA CUDA :: 12",
         "Intended Audience :: Developers",
         "Intended Audience :: Science/Research",
         "Programming Language :: Python :: 3",
