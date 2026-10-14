@@ -5,4 +5,4 @@
 __version__ = "4.8.3"
 
 # Version of rapido-whisper, the Whisper-only CTranslate2 engine (pip distribution).
-rapido_version = "0.1.0"
+rapido_version = "0.1.1"
