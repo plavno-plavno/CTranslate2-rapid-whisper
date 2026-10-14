@@ -1,27 +1,38 @@
 import sys
 
 if sys.platform == "linux":
-    # CUDA is loaded at runtime: the library opens libcublas.so.12 by name on first use.
-    # The usual search (LD_LIBRARY_PATH, a system CUDA installation) comes first; when it
-    # finds nothing, cuBLAS is loaded from the nvidia-cublas-cu12 wheel (the "cuda" extra),
-    # which lives outside the search path, so that the later dlopen by name finds it.
+    # CUDA is loaded at runtime: the library opens libcublas.so.12 by name on first use,
+    # and the cuBLAS version decides the exact floating point results. cuBLAS is loaded
+    # here, in this order, so that the dlopen by name finds it:
+    #  1. a libcublas.so.12 in a directory of LD_LIBRARY_PATH (an explicit choice);
+    #  2. the nvidia-cublas-cu12 wheel (the "cuda" extra, or torch's CUDA 12 builds),
+    #     which lives outside the library search path;
+    #  3. whatever the system linker finds (a system CUDA installation).
     def _load_cublas():
         import ctypes
         import os
 
         mode = getattr(os, "RTLD_GLOBAL", 0)
+        explicit = any(
+            os.path.exists(os.path.join(d, "libcublas.so.12"))
+            for d in os.environ.get("LD_LIBRARY_PATH", "").split(":")
+            if d
+        )
+        if not explicit:
+            try:
+                import nvidia.cublas
+
+                for base in nvidia.cublas.__path__:
+                    lib_dir = os.path.join(base, "lib")
+                    if os.path.exists(os.path.join(lib_dir, "libcublas.so.12")):
+                        ctypes.CDLL(os.path.join(lib_dir, "libcublasLt.so.12"), mode=mode)
+                        ctypes.CDLL(os.path.join(lib_dir, "libcublas.so.12"), mode=mode)
+                        return
+            except (ImportError, OSError):
+                pass
         try:
             ctypes.CDLL("libcublas.so.12", mode=mode)
-            return
         except OSError:
-            pass
-        try:
-            import nvidia.cublas
-
-            lib_dir = os.path.join(list(nvidia.cublas.__path__)[0], "lib")
-            for name in ("libcublasLt.so.12", "libcublas.so.12"):
-                ctypes.CDLL(os.path.join(lib_dir, name), mode=mode)
-        except (ImportError, OSError, IndexError):
             pass  # No cuBLAS: CUDA calls raise a clear error later.
 
     _load_cublas()

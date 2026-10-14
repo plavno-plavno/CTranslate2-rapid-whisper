@@ -60,8 +60,11 @@ pip install "CTranslate2-rapid-whisper[cuda]"
 ```
 
 The wheels are built like the upstream ctranslate2 wheels: without cuDNN and with CUDA
-loaded at runtime, so they produce the same outputs as the upstream wheel. cuBLAS 12 comes
-from the `cuda` extra (`nvidia-cublas-cu12`) or from a system CUDA installation.
+loaded at runtime, so they produce the same outputs as the upstream wheel with the same
+cuBLAS. The cuBLAS version decides the exact floating point results; `import ctranslate2`
+loads cuBLAS 12 from, in this order: a `libcublas.so.12` in `LD_LIBRARY_PATH`, the
+`nvidia-cublas-cu12` wheel (the `cuda` extra, also pulled by torch's CUDA 12 builds), the
+system CUDA. Pin `nvidia-cublas-cu12` (e.g. `==12.8.4.1`) to get the same results everywhere.
 
 The distribution installs the `ctranslate2` module, so it replaces the upstream
 `ctranslate2` package and cannot be installed next to it. faster-whisper declares a
