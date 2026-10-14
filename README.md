@@ -86,20 +86,26 @@ Versions: `ctranslate2.__version__` stays at the API-compatible `4.8.3`, and
 | Variable | Default | Effect |
 |---|---|---|
 | `CT2_CUDA_GRAPHS` | `0` | Run decoder steps as CUDA graphs. Outputs are bit-identical. |
-| `CT2_CUDA_GRAPHS_MAX_STEPS` | `448` | Capacity of the persistent self-attention caches. Longer decodes continue on the regular path. |
+| `CT2_CUDA_GRAPHS_MAX_STEPS` | `128` | Last decoding step run as a graph, and capacity of the persistent self-attention caches. Longer decodes continue on the regular path. |
 | `CT2_CUDA_GRAPHS_MAX_BUFFER_SETS` | `2` | Buffer sets kept, one per decoding shape (batch × beams, encoder output). |
 | `CT2_CUDA_GRAPHS_MEMLOG` | `0` | Log the graphs' device memory (info level, e.g. with `CT2_VERBOSE=1`). |
 | `CT2_CUDA_GRAPHS_DEVICE_GREEDY` | `1` | Greedy token selection inside the graph (no-timestamp greedy only). |
 | `CT2_CUDA_GRAPHS_QUEUE` | `2` | Greedy steps queued before reading their results. |
 | `CT2_WHISPER_FOLD_PREFIX` | `0` | Forward a text prefix in one pass. **Not bit-identical**: scores differ in the last fp16 bits. |
 
-Memory: the graphs keep persistent buffers per decoding shape: the self-attention caches
-at full capacity (twice, ping-pong) and the cross-attention keys/values. For large-v3 in
-float16 a beam-3 single-window set is about 0.7 GB. Measured on 82 interview windows with
-beam 3 and temperature fallback: peak device memory 6.4 GB against 5.3 GB for the upstream
-wheel. Random sampling (the temperature fallback) and batches that shrink during a call are
-decoded without graphs, so they allocate no buffer sets. Lower `CT2_CUDA_GRAPHS_MAX_STEPS`
-to trade the graphs on long decodes for memory.
+Memory: every captured step graph holds ~8 MB of device memory (the launch parameters of
+its ~1000 kernels), and each decoding shape keeps persistent buffers: the self-attention
+caches at full capacity (twice, ping-pong) and the cross-attention keys/values. Random
+sampling (the temperature fallback) and batches that shrink during a call are decoded
+without graphs. Measured on an RTX 4090 with large-v3 float16, 82 interview windows of
+30 s, beam 3 with temperature fallback:
+
+| | peak device memory | time |
+|---|---|---|
+| upstream ctranslate2 4.8.1 wheel | 5.5 GB | 92 s |
+| rapido, `CT2_CUDA_GRAPHS_MAX_STEPS=128` (default) | 6.7 GB | 83 s |
+| rapido, `CT2_CUDA_GRAPHS_MAX_STEPS=448` | 7.9 GB | 83 s |
+| rapido, `CT2_CUDA_GRAPHS_MAX_STEPS=96` | 6.4 GB | 87 s |
 
 ## Verification
 

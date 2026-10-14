@@ -451,8 +451,11 @@ namespace ctranslate2 {
       return enabled;
     }
 
+    // Steps beyond this one take the regular path. Each captured step graph holds ~8 MB of
+    // device memory (launch parameters of its ~1000 kernels) on top of the caches sized
+    // for this capacity; 128 covers streaming windows (up to 15 s) and most 30 s windows.
     static dim_t cuda_graphs_max_steps() {
-      static const dim_t max_steps = read_int_from_env("CT2_CUDA_GRAPHS_MAX_STEPS", 448);
+      static const dim_t max_steps = read_int_from_env("CT2_CUDA_GRAPHS_MAX_STEPS", 128);
       return max_steps;
     }
 
