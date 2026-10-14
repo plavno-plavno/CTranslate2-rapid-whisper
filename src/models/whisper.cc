@@ -239,8 +239,11 @@ namespace ctranslate2 {
       if (prompts.empty())
         return {};
 
-      // The search below decodes a single state owned by this call.
-      const layers::ScopedStepGraphs scoped_step_graphs;
+      // The search below decodes a single state owned by this call. Random sampling (the
+      // temperature fallback) is left out: its batch shrinks as hypotheses finish and its
+      // graphs are rarely replayed, so they would cost buffers and captures for nothing.
+      const bool random_sampling = options.beam_size == 1 && options.sampling_topk != 1;
+      const layers::ScopedStepGraphs scoped_step_graphs(!random_sampling);
 
 #ifdef CT2_WITH_CUDA
       const cuda::UseTrueFp16GemmInScope use_true_fp16_gemm(false);

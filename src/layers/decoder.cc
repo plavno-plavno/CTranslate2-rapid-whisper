@@ -15,10 +15,16 @@ namespace ctranslate2 {
       return active;
     }
 
-    ScopedStepGraphs::ScopedStepGraphs()
+    static uint64_t& step_graphs_epoch() {
+      static thread_local uint64_t epoch = 0;
+      return epoch;
+    }
+
+    ScopedStepGraphs::ScopedStepGraphs(bool enable)
       : _previous(step_graphs_active())
     {
-      step_graphs_active() = true;
+      step_graphs_active() = enable;
+      ++step_graphs_epoch();
     }
 
     ScopedStepGraphs::~ScopedStepGraphs() {
@@ -27,6 +33,10 @@ namespace ctranslate2 {
 
     bool ScopedStepGraphs::active() {
       return step_graphs_active();
+    }
+
+    uint64_t ScopedStepGraphs::epoch() {
+      return step_graphs_epoch();
     }
 
     Decoder::Decoder(Device device)

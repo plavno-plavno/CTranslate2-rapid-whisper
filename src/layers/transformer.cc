@@ -284,6 +284,39 @@ namespace ctranslate2 {
     }
 
 #ifdef CT2_WITH_CUDA
+    // CT2_CUDA_GRAPHS_MEMLOG=1: device memory of the step graphs (graph memory pool, the
+    // stream-ordered default pool, persistent buffers), logged on buffer set changes and
+    // every 64 captures.
+    static bool step_graphs_memlog() {
+      static const bool enabled = read_bool_from_env("CT2_CUDA_GRAPHS_MEMLOG", false);
+      return enabled;
+    }
+
+    static void log_step_graphs_memory(const char* event,
+                                       size_t buffers_total,
+                                       const std::string& sets,
+                                       size_t num_graphs) {
+      int device = 0;
+      cudaGetDevice(&device);
+      unsigned long long graph_used = 0, graph_reserved = 0;
+      cudaDeviceGetGraphMemAttribute(device, cudaGraphMemAttrUsedMemCurrent, &graph_used);
+      cudaDeviceGetGraphMemAttribute(device, cudaGraphMemAttrReservedMemCurrent, &graph_reserved);
+      cudaMemPool_t pool;
+      unsigned long long pool_used = 0, pool_reserved = 0;
+      if (cudaDeviceGetDefaultMemPool(&pool, device) == cudaSuccess) {
+        cudaMemPoolGetAttribute(pool, cudaMemPoolAttrUsedMemCurrent, &pool_used);
+        cudaMemPoolGetAttribute(pool, cudaMemPoolAttrReservedMemCurrent, &pool_reserved);
+      }
+      size_t free_mem = 0, total_mem = 0;
+      cudaMemGetInfo(&free_mem, &total_mem);
+      constexpr double mb = 1024. * 1024.;
+      spdlog::info("step graphs memory [{}]: graph pool used {:.0f} / reserved {:.0f} MB, "
+                   "default pool used {:.0f} / reserved {:.0f} MB, buffers {:.0f} MB (sets:{}), "
+                   "{} graphs, device free {:.0f} MB",
+                   event, graph_used / mb, graph_reserved / mb, pool_used / mb,
+                   pool_reserved / mb, buffers_total / mb, sets, num_graphs, free_mem / mb);
+    }
+
     // A decoding step launches ~30 kernels per layer, each for a [batch, 1, depth] input,
     // so for small batches the step is bound by kernel launch overhead. With
     // CT2_CUDA_GRAPHS=1 each step is captured once into a CUDA graph and replayed in later
@@ -328,6 +361,7 @@ namespace ctranslate2 {
         StorageView logits;
         dim_t batch_size = 0;
         dim_t max_logits_size = 0;
+        size_t bytes = 0;  // Persistent device buffers, for CT2_CUDA_GRAPHS_MEMLOG.
         // Step whose input ids are in `ids` after a queued greedy step (-1: none).
         dim_t ids_step = -1;
         // Greedy selection results, [num_result_slots][batch], and their host copies.
@@ -362,21 +396,37 @@ namespace ctranslate2 {
       Buffers* last_greedy_buffers = nullptr;
       dim_t output_layer_version = -1;
       bool disabled = false;
+      size_t num_captures = 0;
+      // The decoding call (ScopedStepGraphs::epoch) and the buffer set it started with.
+      uint64_t epoch = 0;
+      bool epoch_started = false;
+      BufferKey epoch_key;
+
+      void log_memory(const char* event) const {
+        if (!step_graphs_memlog())
+          return;
+        size_t bytes = 0;
+        size_t num_graphs = 0;
+        std::string sets;
+        for (const auto& [key, set] : buffers) {
+          bytes += set.bytes;
+          num_graphs += set.graphs.size();
+          sets += " b" + std::to_string(set.batch_size);
+        }
+        log_step_graphs_memory(event, bytes, sets, num_graphs);
+      }
 
       void touch(const BufferKey& key) {
         recently_used.remove(key);
         recently_used.push_front(key);
       }
 
-      // Frees the least recently used sets beyond max_sets, never `keep`. The state no
-      // longer views them: it was staged into `keep` before this is called.
-      void evict(const BufferKey& keep, size_t max_sets) {
-        while (buffers.size() > max_sets && recently_used.size() > 1) {
-          const BufferKey victim = recently_used.back();
-          if (victim == keep)
-            break;
-          // Pending work may still read the victim's buffers (state staging copies).
+      // Frees least recently used sets until a new one fits within max_sets. Only called
+      // before the first step of a decoding call, when the state views no set.
+      void evict_before_insert(size_t max_sets) {
+        while (!buffers.empty() && buffers.size() >= max_sets) {
           cudaStreamSynchronize(cuda::get_cuda_stream());
+          const BufferKey victim = recently_used.back();
           auto it = buffers.find(victim);
           if (last_greedy_buffers == &it->second)
             last_greedy_buffers = nullptr;
@@ -531,6 +581,29 @@ namespace ctranslate2 {
       const dim_t output_size = this->output_size();
 
       const StepGraphs::BufferKey buffers_key(batch_size, num_heads, depth, memory_shape);
+      static const size_t max_buffer_sets = std::max(
+        1, read_int_from_env("CT2_CUDA_GRAPHS_MAX_BUFFER_SETS", 2));
+
+      // A new buffer set (up to ~2 GB) is only made for the batch a decoding call starts
+      // with. When the batch shrinks during the call (finished batches are dropped), the
+      // remaining steps take the regular path unless a set of that shape already exists.
+      const uint64_t epoch = ScopedStepGraphs::epoch();
+      if (!graphs.epoch_started || graphs.epoch != epoch) {
+        graphs.epoch = epoch;
+        graphs.epoch_started = true;
+        graphs.epoch_key = buffers_key;
+      }
+      const bool known_set = graphs.buffers.count(buffers_key) > 0;
+      if (!known_set && buffers_key != graphs.epoch_key)
+        return false;
+      if (!known_set) {
+        // Make room before allocating: the state of this call is not staged anywhere yet.
+        const size_t num_sets = graphs.buffers.size();
+        graphs.evict_before_insert(max_buffer_sets);
+        if (graphs.buffers.size() != num_sets)
+          graphs.log_memory("evicted");
+      }
+
       auto [buffers_it, inserted] = graphs.buffers.try_emplace(buffers_key);
       StepGraphs::Buffers& buffers = buffers_it->second;
       graphs.touch(buffers_key);
@@ -570,6 +643,12 @@ namespace ctranslate2 {
         buffers.result_scores = StorageView({num_results}, dtype, _device);
         CUDA_CHECK(cudaMallocHost(&buffers.host_ids, num_results * sizeof (int32_t)));
         CUDA_CHECK(cudaMallocHost(&buffers.host_scores, num_results * sizeof (float)));
+        const size_t item = buffers.logits.item_size();
+        buffers.bytes = item * (4 * num_layers * max_cache_size
+                                + (_with_encoder_attention ? 2 * num_layers * memory_size : 0)
+                                + buffers.max_logits_size + num_results)
+                        + sizeof (int32_t) * (batch_size + num_results);
+        graphs.log_memory("new buffer set");
       }
       if (batch_size * output_size > buffers.max_logits_size)
         return false;
@@ -631,9 +710,6 @@ namespace ctranslate2 {
       } else {
         buffers.ids.reshape({batch_size});
       }
-      static const size_t max_buffer_sets = std::max(
-        1, read_int_from_env("CT2_CUDA_GRAPHS_MAX_BUFFER_SETS", 2));
-      graphs.evict(buffers_key, max_buffer_sets);
 
       cudaStream_t stream = cuda::get_cuda_stream();
       const StepGraphs::GraphKey graph_key(step,
@@ -695,6 +771,9 @@ namespace ctranslate2 {
           }
           return false;
         }
+
+        if (++graphs.num_captures % 64 == 0)
+          graphs.log_memory("captures");
 
         StepGraphs::Graph new_graph;
         new_graph.exec = exec;

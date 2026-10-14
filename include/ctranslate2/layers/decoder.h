@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <map>
 #include <mutex>
 #include <string>
@@ -17,11 +18,14 @@ namespace ctranslate2 {
     // of the same shape. They are only safe while a single state is being decoded, so they
     // are enabled only inside the model's own decoding loops (e.g. Whisper generate), not
     // for states held and stepped by the caller.
+    // Each scope is one decoding call: epoch() changes with every scope, so the graphs
+    // can tell the batch a call started with from a batch that shrank during it.
     class ScopedStepGraphs {
     public:
-      ScopedStepGraphs();
+      ScopedStepGraphs(bool enable = true);
       ~ScopedStepGraphs();
       static bool active();
+      static uint64_t epoch();
     private:
       const bool _previous;
     };
