@@ -112,7 +112,7 @@ without graphs. Measured on an RTX 4090 with large-v3 float16, 82 interview wind
 Every release is checked against the upstream `ctranslate2` 4.8.1 wheel from PyPI, the one
 production used, with faster-whisper 1.2.1 and Systran/faster-whisper-large-v3 in float16,
 the same cuBLAS 12.8.4.1 and a fixed random seed (the temperature fallback samples). The
-workload is three Russian interviews (5.6 h): every third 30 s window decoded three ways
+workload is three long-form interviews (5.6 h): every third 30 s window decoded three ways
 (beam 3 with temperature fallback, beam 3 at temperature 0, greedy), and streaming with
 LocalAgreement on nine 5-minute segments (the window grows by 0.5 s per round, up to
 15 s). Tokens, scores, no-speech probabilities, word timestamps and every streaming round
@@ -128,7 +128,7 @@ On the RTX 4090 the GPU was shared with other services, so its times are noisier
 release wheel (graphs up to step 128 by default) measured 751 s and 1923 s on the RTX 5080
 in a later run.
 
-Live streaming server (wfs2, agent mode, four recorded Russian sessions replayed in real
+Live streaming server (wfs2, agent mode, four recorded sessions replayed in real
 time, RTX 5080), ASR time per call:
 
 | | p50 | p95 | ASR calls in the same time |
