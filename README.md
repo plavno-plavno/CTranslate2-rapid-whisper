@@ -107,14 +107,43 @@ without graphs. Measured on an RTX 4090 with large-v3 float16, 82 interview wind
 | rapido, `CT2_CUDA_GRAPHS_MAX_STEPS=448` | 7.9 GB | 83 s |
 | rapido, `CT2_CUDA_GRAPHS_MAX_STEPS=96` | 6.4 GB | 87 s |
 
-## Verification
+## Verification and speed
 
-The equivalence tooling lives outside the library: `compare_ct2.py` (1340 outputs covering
-greedy, beam, n-best, batches, prefixes, timestamps and faster-whisper `transcribe` with
-word timestamps), `fork_check.py` (long-form interviews and streaming with
-LocalAgreement) and `stream_la.py`. Against CTranslate2 4.8.3, with and without CUDA
-graphs, they report 0 differing tokens and 0 differing scores, no-speech probabilities and
-word times, and identical streaming rounds.
+Every release is checked against the upstream `ctranslate2` 4.8.1 wheel from PyPI, the one
+production used, with faster-whisper 1.2.1 and Systran/faster-whisper-large-v3 in float16,
+the same cuBLAS 12.8.4.1 and a fixed random seed (the temperature fallback samples). The
+workload is three Russian interviews (5.6 h): every third 30 s window decoded three ways
+(beam 3 with temperature fallback, beam 3 at temperature 0, greedy), and streaming with
+LocalAgreement on nine 5-minute segments (the window grows by 0.5 s per round, up to
+15 s). Tokens, scores, no-speech probabilities, word timestamps and every streaming round
+are compared exactly. rapido runs with `CT2_CUDA_GRAPHS=1`.
+
+| | RTX 5080 (sm_120) | RTX 4090 (sm_89) |
+|---|---|---|
+| differences in 672 windows and 5400 streaming rounds | 0 | 0 |
+| 30 s windows: upstream → rapido | 796 s → 709 s (−11%) | 689 s → 609 s (−12%) |
+| streaming with LocalAgreement: upstream → rapido | 2134 s → 1798 s (−16%) | 1681 s → 1544 s (−8%) |
+
+On the RTX 4090 the GPU was shared with other services, so its times are noisier. The
+release wheel (graphs up to step 128 by default) measured 751 s and 1923 s on the RTX 5080
+in a later run.
+
+Live streaming server (wfs2, agent mode, four recorded Russian sessions replayed in real
+time, RTX 5080), ASR time per call:
+
+| | p50 | p95 | ASR calls in the same time |
+|---|---|---|---|
+| upstream ctranslate2 | 184 ms | 385 ms | 3302 |
+| rapido | 163 ms | 316 ms | 3797 |
+
+The faster engine lets LocalAgreement run more, shorter-spaced rounds. The turn texts of
+the two runs differ by 8.0%, within the noise of real-time replay: two runs of the
+upstream engine differ by 8.9%, because the rounds land at different moments.
+
+The release checks also cover CUDA graph capture next to onnxruntime CUDA sessions on the
+same GPU (Silero VAD and SmartTurn run next to Whisper in a streaming server), peak device
+memory, and the CrisperWhisper decoding APIs (their tokens match the nyrahealth CTranslate2
+fork they come from).
 
 ## License
 
