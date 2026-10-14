@@ -1,0 +1,64 @@
+name: Wheels
+
+# Linux x86_64 wheels of CTranslate2-rapid-whisper. A v* tag also publishes them to PyPI
+# through trusted publishing (environment "pypi"); the tag must match rapido_version in
+# python/ctranslate2/version.py. Manual runs only build.
+on:
+  push:
+    tags:
+      - v*
+  workflow_dispatch:
+
+jobs:
+  build-wheels:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: recursive
+
+      - name: Check the tag against the package version
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          version=$(python3 -c "exec(open('python/ctranslate2/version.py').read()); print(rapido_version)")
+          test "${GITHUB_REF_NAME}" = "v${version}" || { echo "tag ${GITHUB_REF_NAME} != v${version}"; exit 1; }
+
+      - name: Free disk space for the CUDA toolkit
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+
+      - name: Build wheels
+        uses: pypa/cibuildwheel@v3.2.1
+        with:
+          package-dir: python
+          output-dir: python/wheelhouse
+        env:
+          CIBW_BEFORE_ALL_LINUX: python/tools/prepare_build_environment_linux.sh
+          CIBW_BEFORE_BUILD: pip install -r python/install_requirements.txt
+          CIBW_MANYLINUX_X86_64_IMAGE: manylinux_2_28
+          CIBW_ARCHS_LINUX: x86_64
+          CIBW_BUILD: "cp39-* cp310-* cp311-* cp312-* cp313-* cp314-*"
+          CIBW_SKIP: "*-musllinux_* *t-*"
+          # No GPU on the runner: CUDA is loaded at runtime, so the import still works.
+          CIBW_TEST_COMMAND: python -c "import ctranslate2; print(ctranslate2.__version__, ctranslate2.rapido_version)"
+
+      - uses: actions/upload-artifact@v6
+        with:
+          name: python-wheels
+          path: python/wheelhouse
+
+  publish:
+    needs: build-wheels
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/CTranslate2-rapid-whisper
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: python-wheels
+          path: dist
+
+      - uses: pypa/gh-action-pypi-publish@release/v1

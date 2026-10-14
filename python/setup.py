@@ -68,7 +68,7 @@ ctranslate2_module = Extension(
 ParallelCompile("CMAKE_BUILD_PARALLEL_LEVEL").install()
 
 setup(
-    name="rapido-whisper",
+    name="CTranslate2-rapid-whisper",
     version=_get_project_version(),
     license="MIT",
     description=(
@@ -81,7 +81,7 @@ setup(
     url="https://github.com/plavno-plavno/CTranslate2-rapid-whisper",
     classifiers=[
         "Development Status :: 5 - Production/Stable",
-        "Environment :: GPU :: NVIDIA CUDA :: 12 :: 12.4",
+        "Environment :: GPU :: NVIDIA CUDA :: 12 :: 12.8",
         "Intended Audience :: Developers",
         "Intended Audience :: Science/Research",
         "Programming Language :: Python :: 3",
@@ -107,6 +107,8 @@ setup(
         "numpy",
         "pyyaml>=5.3,<7",
     ],
+    # CUDA is loaded at runtime: cuBLAS 12 from the system or from this extra.
+    extras_require={"cuda": ["nvidia-cublas-cu12"]},
     entry_points={
         "console_scripts": [
             "ct2-transformers-converter=ctranslate2.converters.transformers:main",

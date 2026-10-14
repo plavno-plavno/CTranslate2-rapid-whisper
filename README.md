@@ -13,7 +13,7 @@ cuBLAS version. Speedups that change floating point rounding are opt-in or left 
 
 - Whisper only: encoder, decoder, `generate`, `align`, `detect_language`, and the
   Transformers Whisper converter (`ct2-transformers-converter`).
-- CUDA only, built for Blackwell (sm_120). Ada (sm_89) is planned and is a build flag.
+- CUDA only, native code for Ada (sm_89: RTX 40xx, L4, L40) and Blackwell (sm_120: RTX 50xx).
 - Compute types `float16`, `bfloat16` and `float32`. `auto` resolves to `float16`.
 - **CUDA graphs for decoder steps** (`CT2_CUDA_GRAPHS=1`). Each step is captured once and
   replayed in later calls, for example in every window of streaming ASR. The graphs run
@@ -32,14 +32,16 @@ norms). A model that needs any of them is rejected at load time with an explicit
 
 ## Build
 
-Requirements: CUDA 12.8+ (sm_120 needs it), cuDNN 9, CMake ≥ 3.18 and GCC.
+Requirements: CUDA 12.8+ (sm_120 needs it), CMake ≥ 3.18 and GCC. The release flags below
+match the wheels; `-DWITH_CUDNN=ON` runs the encoder's conv1d through cuDNN instead, which
+changes its rounding.
 
 ```bash
 git submodule update --init --recursive
 mkdir build && cd build
-cmake .. -DCMAKE_BUILD_TYPE=Release -DWITH_CUDA=ON -DWITH_CUDNN=ON \
+cmake .. -DCMAKE_BUILD_TYPE=Release -DWITH_CUDA=ON -DWITH_CUDNN=OFF -DCUDA_DYNAMIC_LOADING=ON \
   -DCUDA_TOOLKIT_ROOT_DIR=/usr/local/cuda-12.8 \
-  "-DCUDA_ARCH_FLAGS_OVERRIDE=-gencode;arch=compute_120,code=sm_120;-gencode;arch=compute_120,code=compute_120" \
+  "-DCUDA_ARCH_FLAGS_OVERRIDE=-gencode;arch=compute_89,code=sm_89;-gencode;arch=compute_120,code=sm_120;-gencode;arch=compute_120,code=compute_120" \
   -DCMAKE_INSTALL_PREFIX=$PWD/../install
 make -j$(nproc) install
 
@@ -51,11 +53,24 @@ CTRANSLATE2_ROOT=$PWD/../install pip install --no-build-isolation .
 FindCUDA cannot parse two-digit architectures such as 12.0. Set `LD_LIBRARY_PATH` to
 `install/lib` at runtime.
 
-The pip distribution is named `rapido-whisper` and installs the `ctranslate2` module.
-faster-whisper declares a `ctranslate2` dependency, so install it with `--no-deps`.
-Otherwise pip installs the upstream package over this one:
+## Install
 
 ```bash
+pip install "CTranslate2-rapid-whisper[cuda]"
+```
+
+The wheels are built like the upstream ctranslate2 wheels: without cuDNN and with CUDA
+loaded at runtime, so they produce the same outputs as the upstream wheel. cuBLAS 12 comes
+from the `cuda` extra (`nvidia-cublas-cu12`) or from a system CUDA installation.
+
+The distribution installs the `ctranslate2` module, so it replaces the upstream
+`ctranslate2` package and cannot be installed next to it. faster-whisper declares a
+`ctranslate2` dependency; install it with `--no-deps`, otherwise pip installs the upstream
+package over this one:
+
+```bash
+pip uninstall -y ctranslate2
+pip install "CTranslate2-rapid-whisper[cuda]"
 pip install --no-deps faster-whisper
 pip install "av>=11,<16" tokenizers onnxruntime huggingface_hub tqdm
 ```
