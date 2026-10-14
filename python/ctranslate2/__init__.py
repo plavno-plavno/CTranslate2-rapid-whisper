@@ -1,32 +1,31 @@
 import sys
 
-if sys.platform == "win32":
-    import ctypes
-    import glob
-    import os
+if sys.platform == "linux":
+    # CUDA is loaded at runtime: the library opens libcublas.so.12 by name on first use.
+    # The usual search (LD_LIBRARY_PATH, a system CUDA installation) comes first; when it
+    # finds nothing, cuBLAS is loaded from the nvidia-cublas-cu12 wheel (the "cuda" extra),
+    # which lives outside the search path, so that the later dlopen by name finds it.
+    def _load_cublas():
+        import ctypes
+        import os
 
-    from importlib.resources import files
-
-    module_name = sys.modules[__name__].__name__
-    package_dir = str(files(module_name))
-
-    # The libraries package name differs across ROCm releases.
-    site_dir = os.path.dirname(package_dir)
-    dll_dirs = [os.path.join(site_dir, "_rocm_sdk_core", "bin")]
-    dll_dirs += sorted(glob.glob(os.path.join(site_dir, "_rocm_sdk_libraries*", "bin")))
-    dll_dirs = [path for path in dll_dirs if os.path.isdir(path)]
-    # Fallback only: the search order between DLL directories is unspecified.
-    if not dll_dirs and os.environ.get("HIP_PATH"):
-        dll_dirs = [os.path.join(os.environ["HIP_PATH"], "bin")]
-
-    for path in [package_dir] + dll_dirs:
+        mode = getattr(os, "RTLD_GLOBAL", 0)
         try:
-            os.add_dll_directory(path)
+            ctypes.CDLL("libcublas.so.12", mode=mode)
+            return
         except OSError:
             pass
+        try:
+            import nvidia.cublas
 
-    for library in glob.glob(os.path.join(package_dir, "*.dll")):
-        ctypes.CDLL(library)
+            lib_dir = os.path.join(list(nvidia.cublas.__path__)[0], "lib")
+            for name in ("libcublasLt.so.12", "libcublas.so.12"):
+                ctypes.CDLL(os.path.join(lib_dir, name), mode=mode)
+        except (ImportError, OSError, IndexError):
+            pass  # No cuBLAS: CUDA calls raise a clear error later.
+
+    _load_cublas()
+    del _load_cublas
 
 try:
     from ctranslate2._ext import (
